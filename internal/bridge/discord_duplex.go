@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -177,6 +178,7 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 
 	streaming := false
 	lastReady := true
+	ratchetMissing := false
 	var speakingStart time.Time
 	var noDataTicks int // Consecutive sender ticks with no data from buffer
 
@@ -207,9 +209,7 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 		}
 
 		err := voiceConn.SendOpus(opus)
-		if err != nil {
-			dd.Bridge.Logger.Debug("DISCORD_SEND", fmt.Sprintf("Error sending opus: %v", err))
-
+		if !dd.handleDiscordSendResult(err, &ratchetMissing) {
 			return
 		}
 
@@ -309,6 +309,33 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 			}
 		}
 	}
+}
+
+// handleDiscordSendResult tracks missing-key-ratchet episodes independently
+// from voice connection readiness and reports whether the packet was sent.
+func (dd *DiscordDuplex) handleDiscordSendResult(err error, ratchetMissing *bool) bool {
+	if err == nil {
+		if *ratchetMissing {
+			dd.Bridge.Logger.Info("DISCORD_SEND", "Discord opus sender recovered from missing key ratchet")
+			*ratchetMissing = false
+		}
+
+		return true
+	}
+
+	if strings.Contains(err.Error(), "missing key ratchet") {
+		if !*ratchetMissing {
+			dd.Bridge.Logger.Warn("DISCORD_SEND", "Discord opus sender missing key ratchet; sinking packets until recovery")
+			*ratchetMissing = true
+		}
+		promPacketsSunk.WithLabelValues("discord", "outbound").Inc()
+
+		return false
+	}
+
+	dd.Bridge.Logger.Debug("DISCORD_SEND", fmt.Sprintf("Error sending opus: %v", err))
+
+	return false
 }
 
 // discordReceivePCM receives opus packets from Discord, decodes to PCM.

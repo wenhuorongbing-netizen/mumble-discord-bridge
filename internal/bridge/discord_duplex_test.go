@@ -2,17 +2,60 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	gopus "github.com/stieneee/gopus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/stieneee/mumble-discord-bridge/internal/discord"
 )
+
+func TestDiscordSendResult_MissingKeyRatchetTransitions(t *testing.T) {
+	mockLog := NewMockLogger()
+	dd := NewDiscordDuplex(createTestBridgeState(mockLog))
+	ratchetMissing := false
+	sunk := promPacketsSunk.WithLabelValues("discord", "outbound")
+	sunkBefore := testutil.ToFloat64(sunk)
+	missingErr := errors.New("send failed: missing key ratchet")
+
+	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing))
+	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing))
+	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing))
+
+	assert.Equal(t, sunkBefore+3, testutil.ToFloat64(sunk), "every missing-ratchet packet must be sunk")
+	assert.True(t, ratchetMissing, "the later missing-ratchet episode must enter missing state")
+
+	entries := mockLog.GetEntries()
+	var warnings, recoveries int
+	for _, entry := range entries {
+		if entry.Level == "WARN" && entry.Message == "Discord opus sender missing key ratchet; sinking packets until recovery" {
+			warnings++
+		}
+		if entry.Level == "INFO" && entry.Message == "Discord opus sender recovered from missing key ratchet" {
+			recoveries++
+		}
+	}
+	assert.Equal(t, 2, warnings, "each missing-ratchet episode must warn exactly once")
+	assert.Equal(t, 1, recoveries, "only the first success after an episode must log recovery")
+}
+
+func TestDiscordSendResult_NonRatchetErrorPreservesDebugBehavior(t *testing.T) {
+	mockLog := NewMockLogger()
+	dd := NewDiscordDuplex(createTestBridgeState(mockLog))
+	ratchetMissing := false
+
+	assert.False(t, dd.handleDiscordSendResult(errors.New("ordinary send failure"), &ratchetMissing))
+	assert.False(t, ratchetMissing)
+	assert.True(t, mockLog.ContainsMessage("Error sending opus: ordinary send failure"))
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
