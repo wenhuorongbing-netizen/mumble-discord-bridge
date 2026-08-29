@@ -572,3 +572,26 @@ func TestMessageCreate_CommandFromCorrectChannel(t *testing.T) {
 	assert.Contains(t, msgs[0].content, "Commands:", "response should contain the help text")
 	assert.Equal(t, bs.BridgeConfig.CID, msgs[0].channelID, "response should be sent to the configured channel")
 }
+
+func TestMessageCreate_DisabledChatDoesNotLeakMessageData(t *testing.T) {
+	l, bs, mc := setupDiscordHandlerTest(nil)
+	bs.BridgeConfig.ChatBridge = false
+	mockLog := bs.Logger.(*MockLogger)
+	content := "canary-content-7f91b3"
+	username := "canary-user-4d82c6"
+
+	l.OnMessageCreate(&discord.Message{
+		ID:        "msg-privacy-canary",
+		ChannelID: bs.BridgeConfig.CID,
+		GuildID:   bs.BridgeConfig.GID,
+		Content:   content,
+		Author:    discord.User{ID: "privacy-canary-user", Username: username},
+	})
+
+	for _, entry := range mockLog.GetEntries() {
+		assert.NotContains(t, entry.Message, content)
+		assert.NotContains(t, entry.Message, username)
+	}
+	assert.True(t, mockLog.ContainsMessage("Discord chat message ignored because ChatBridge is disabled"))
+	assert.Empty(t, mc.getSentMessages())
+}

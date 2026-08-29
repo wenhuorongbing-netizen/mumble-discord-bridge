@@ -180,11 +180,12 @@ func main() {
 		discordCommand = false
 		mumbleCommand = false
 	}
+	messageEventsEnabled := discordCommand || *chatBridge
 
 	// BRIDGE SETUP
 
 	// Create shared Discord client
-	discordClient, err := bridgelib.NewSharedDiscordClient(*discordToken, nil)
+	discordClient, err := bridgelib.NewSharedDiscordClientWithMessageEvents(*discordToken, nil, messageEventsEnabled)
 	if err != nil {
 		if *cpuprofile != "" {
 			pprof.StopCPUProfile()

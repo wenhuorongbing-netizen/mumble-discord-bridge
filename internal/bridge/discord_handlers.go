@@ -84,7 +84,7 @@ func (l *DiscordListener) OnGuildCreate(guild *discord.Guild) {
 
 // OnMessageCreate handles Discord message creation events.
 func (l *DiscordListener) OnMessageCreate(m *discord.Message) {
-	l.Bridge.Logger.Debug("DISCORD_HANDLER", fmt.Sprintf("MessageCreate called from Discord user: %s", m.Author.Username))
+	l.Bridge.Logger.Debug("DISCORD_HANDLER", "Discord message event received")
 
 	botID := l.Bridge.DiscordClient.GetBotUserID()
 
@@ -271,15 +271,9 @@ func (l *DiscordListener) OnMessageCreate(m *discord.Message) {
 			}
 		}
 	} else if !strings.HasPrefix(m.Content, "!") {
-		// Get a truncated version of the message for logs
-		content := m.Content
-		if len(content) > 50 {
-			content = content[:47] + "..."
-		}
-
 		// Check if chat bridge is enabled
 		if !l.Bridge.BridgeConfig.ChatBridge {
-			l.Bridge.Logger.Debug("DISCORD→MUMBLE", fmt.Sprintf("Chat message received but ChatBridge is DISABLED: %s", content))
+			l.Bridge.Logger.Debug("DISCORD→MUMBLE", "Discord chat message ignored because ChatBridge is disabled")
 
 			return
 		}
@@ -302,7 +296,7 @@ func (l *DiscordListener) OnMessageCreate(m *discord.Message) {
 			return
 		}
 
-		l.Bridge.Logger.Debug("DISCORD→MUMBLE", fmt.Sprintf("Forwarding message from %s", m.Author.Username))
+		l.Bridge.Logger.Debug("DISCORD→MUMBLE", "Forwarding Discord chat message")
 
 		// Get MumbleClient reference under lock to prevent race conditions
 		l.Bridge.BridgeMutex.Lock()

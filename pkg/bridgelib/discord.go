@@ -28,6 +28,11 @@ type SharedDiscordClient struct {
 
 // NewSharedDiscordClient creates a new shared Discord client
 func NewSharedDiscordClient(token string, lgr logger.Logger) (*SharedDiscordClient, error) {
+	return NewSharedDiscordClientWithMessageEvents(token, lgr, true)
+}
+
+// NewSharedDiscordClientWithMessageEvents creates a shared Discord client with optional message events.
+func NewSharedDiscordClientWithMessageEvents(token string, lgr logger.Logger, messageEventsEnabled bool) (*SharedDiscordClient, error) {
 	// Use provided logger or create a default console logger
 	if lgr == nil {
 		lgr = logger.NewConsoleLogger()
@@ -35,7 +40,7 @@ func NewSharedDiscordClient(token string, lgr logger.Logger) (*SharedDiscordClie
 
 	lgr.Debug("DISCORD_CLIENT", "Starting Discord client creation with disgo+godave (DAVE E2EE)")
 
-	client, err := discord.NewDisgoClient(token)
+	client, err := discord.NewDisgoClient(token, messageEventsEnabled)
 	if err != nil {
 		lgr.Error("DISCORD_CLIENT", fmt.Sprintf("Failed to create Discord client: %v", err))
 

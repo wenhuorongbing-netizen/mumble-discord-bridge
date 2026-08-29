@@ -22,28 +22,29 @@ type DisgoClient struct {
 	token string
 	// client is set once in NewDisgoClient and never reassigned. All methods
 	// may read it without holding mu. Do NOT reassign after construction.
-	client   *bot.Client
-	handlers []EventHandler
-	mu       sync.RWMutex
-	ready    bool
-	botID    string
+	client               *bot.Client
+	handlers             []EventHandler
+	mu                   sync.RWMutex
+	ready                bool
+	botID                string
+	messageEventsEnabled bool
 }
 
 // NewDisgoClient creates a new DisgoClient with the given bot token.
-func NewDisgoClient(token string) (*DisgoClient, error) {
+func NewDisgoClient(token string, messageEventsEnabled bool) (*DisgoClient, error) {
 	dc := &DisgoClient{
-		token: token,
+		token:                token,
+		messageEventsEnabled: messageEventsEnabled,
 	}
 
-	client, err := disgo.New(token,
+	intents := gateway.IntentGuilds | gateway.IntentGuildVoiceStates
+	if messageEventsEnabled {
+		intents |= gateway.IntentGuildMessages | gateway.IntentMessageContent | gateway.IntentDirectMessages
+	}
+
+	configOpts := []bot.ConfigOpt{
 		bot.WithGatewayConfigOpts(
-			gateway.WithIntents(
-				gateway.IntentGuilds,
-				gateway.IntentGuildMessages,
-				gateway.IntentGuildVoiceStates,
-				gateway.IntentMessageContent,
-				gateway.IntentDirectMessages,
-			),
+			gateway.WithIntents(intents),
 		),
 		bot.WithCacheConfigOpts(
 			cache.WithCaches(cache.FlagGuilds, cache.FlagVoiceStates, cache.FlagChannels),
@@ -58,12 +59,18 @@ func NewDisgoClient(token string) (*DisgoClient, error) {
 		),
 		bot.WithEventListenerFunc(dc.onReady),
 		bot.WithEventListenerFunc(dc.onGuildAvailable),
-		bot.WithEventListenerFunc(dc.onMessageCreate),
+	}
+	if messageEventsEnabled {
+		configOpts = append(configOpts, bot.WithEventListenerFunc(dc.onMessageCreate))
+	}
+	configOpts = append(configOpts,
 		bot.WithEventListenerFunc(dc.onGuildVoiceJoin),
 		bot.WithEventListenerFunc(dc.onGuildVoiceMove),
 		bot.WithEventListenerFunc(dc.onGuildVoiceLeave),
 		bot.WithLogger(slog.Default()),
 	)
+
+	client, err := disgo.New(token, configOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create disgo client: %w", err)
 	}
@@ -291,6 +298,10 @@ func (dc *DisgoClient) onGuildAvailable(e *events.GuildAvailable) {
 }
 
 func (dc *DisgoClient) onMessageCreate(e *events.MessageCreate) {
+	if !dc.messageEventsEnabled {
+		return
+	}
+
 	handlers := dc.getHandlers()
 	if len(handlers) == 0 {
 		return
