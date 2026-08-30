@@ -18,6 +18,31 @@ const (
 	mumbleMaxBufferDepth   = 6   // Max per-stream chunks before skipping old ones (60ms; prevents clock drift accumulation)
 )
 
+func mixPCM(sources ...[]int16) []int16 {
+	length := 0
+	for _, source := range sources {
+		if len(source) > length {
+			length = len(source)
+		}
+	}
+	mixed := make([]int16, length)
+	for index := range mixed {
+		var sum int32
+		for _, source := range sources {
+			if index < len(source) {
+				sum += int32(source[index])
+			}
+		}
+		if sum > 32767 {
+			sum = 32767
+		} else if sum < -32768 {
+			sum = -32768
+		}
+		mixed[index] = int16(sum)
+	}
+	return mixed
+}
+
 // MumbleDuplex - listener and outgoing
 type MumbleDuplex struct {
 	mutex   sync.Mutex
@@ -82,7 +107,11 @@ func (m *MumbleDuplex) OnAudioStream(e *gumble.AudioStreamEvent) {
 			close(stream)
 			close(done)
 			streamClosed = true
-			m.logger.Debug("MUMBLE_STREAM", fmt.Sprintf("Forcibly closed stream for user: %s during cleanup", e.User.Name))
+			if m.bridge != nil && m.bridge.voiceOnlyPrivacy() {
+				m.logger.Debug("MUMBLE_STREAM", "Forcibly closed Mumble stream during cleanup")
+			} else {
+				m.logger.Debug("MUMBLE_STREAM", fmt.Sprintf("Forcibly closed stream for user: %s during cleanup", e.User.Name))
+			}
 		}
 	}
 	m.mutex.Unlock()
@@ -91,10 +120,19 @@ func (m *MumbleDuplex) OnAudioStream(e *gumble.AudioStreamEvent) {
 
 	go func() {
 		name := e.User.Name
-		m.logger.Info("MUMBLE_STREAM", fmt.Sprintf("New mumble audio stream: %s", name))
+		privacy := m.bridge != nil && m.bridge.voiceOnlyPrivacy()
+		if privacy {
+			m.logger.Info("MUMBLE_STREAM", "New Mumble audio stream")
+		} else {
+			m.logger.Info("MUMBLE_STREAM", fmt.Sprintf("New mumble audio stream: %s", name))
+		}
 		defer func() {
 			if r := recover(); r != nil {
-				m.logger.Error("MUMBLE_STREAM", fmt.Sprintf("Panic in audio stream for %s: %v", name, r))
+				if privacy {
+					m.logger.Error("MUMBLE_STREAM", fmt.Sprintf("Panic in Mumble audio stream: %v", r))
+				} else {
+					m.logger.Error("MUMBLE_STREAM", fmt.Sprintf("Panic in audio stream for %s: %v", name, r))
+				}
 			}
 		}()
 
@@ -124,7 +162,11 @@ func (m *MumbleDuplex) OnAudioStream(e *gumble.AudioStreamEvent) {
 					case stream <- p.AudioBuffer[start:end]:
 					default:
 						// Stream buffer full, drop packet
-						m.logger.Debug("MUMBLE_STREAM", fmt.Sprintf("Stream buffer full for %s, dropping packet", name))
+						if privacy {
+							m.logger.Debug("MUMBLE_STREAM", "Mumble stream buffer full, dropping packet")
+						} else {
+							m.logger.Debug("MUMBLE_STREAM", fmt.Sprintf("Stream buffer full for %s, dropping packet", name))
+						}
 					}
 				}
 				streamMutex.Unlock()
@@ -136,7 +178,11 @@ func (m *MumbleDuplex) OnAudioStream(e *gumble.AudioStreamEvent) {
 			}
 		}
 
-		m.logger.Info("MUMBLE_STREAM", fmt.Sprintf("Mumble audio stream ended: %s", name))
+		if privacy {
+			m.logger.Info("MUMBLE_STREAM", "Mumble audio stream ended")
+		} else {
+			m.logger.Info("MUMBLE_STREAM", fmt.Sprintf("Mumble audio stream ended: %s", name))
+		}
 
 		// Cleanup stream from arrays
 		m.mutex.Lock()
@@ -173,7 +219,7 @@ func (m *MumbleDuplex) MixOneChunk() (mixed []int16, streamingCount int) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	mixed = make([]int16, mumbleAudioChunkSize)
+	var sources [][]int16
 	var maxDepth int
 
 	for i := range m.streams {
@@ -194,9 +240,7 @@ func (m *MumbleDuplex) MixOneChunk() (mixed []int16, streamingCount int) {
 				promMumbleChunksSkipped.Add(float64(skip))
 			}
 			audioData := <-m.streams[i]
-			for j := range mixed {
-				mixed[j] += audioData[j]
-			}
+			sources = append(sources, audioData)
 		}
 	}
 
@@ -206,7 +250,7 @@ func (m *MumbleDuplex) MixOneChunk() (mixed []int16, streamingCount int) {
 		return nil, 0
 	}
 
-	return mixed, streamingCount
+	return mixPCM(sources...), streamingCount
 }
 
 // toMumbleSender sends audio packets from Discord to Mumble's audio channel.

@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,130 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMumble_RetryBudgetEndsInFailed(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), NewMockBridgeEventEmitter())
+	manager.managerConfig = &ConnectionManagerConfig{MaxRetries: 2, BaseRetryDelay: time.Millisecond, MaxRetryDelay: 2 * time.Millisecond, RetryMultiplier: 2}
+	attempts := 0
+	manager.connectFunc = func() error {
+		attempts++
+		return errors.New("connect failed")
+	}
+	done := make(chan struct{})
+	go func() {
+		manager.connectionLoop(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Mumble retry budget did not terminate")
+	}
+	assert.Equal(t, 3, attempts)
+	assert.Equal(t, ConnectionFailed, manager.GetStatus())
+}
+
+func TestMumble_RetryBudgetResetsAfterSuccess(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), NewMockBridgeEventEmitter())
+	manager.managerConfig = &ConnectionManagerConfig{MaxRetries: 1, BaseRetryDelay: time.Millisecond, MaxRetryDelay: time.Millisecond, RetryMultiplier: 2}
+	attempts := 0
+	connected := make(chan struct{}, 2)
+	manager.connectFunc = func() error {
+		attempts++
+		if attempts == 1 || attempts == 3 {
+			return errors.New("transient")
+		}
+		connected <- struct{}{}
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		manager.connectionLoop(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("first Mumble success not reached")
+	}
+	manager.OnDisconnect(&gumble.DisconnectEvent{Type: gumble.DisconnectError, String: "test outage"})
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("second Mumble success not reached")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Mumble reset test did not terminate")
+	}
+	assert.Equal(t, 4, attempts, "each post-success episode must receive a fresh retry budget")
+}
+
+func TestMumble_ConfiguredChannelFailureNeverConnects(t *testing.T) {
+	emitter := NewMockBridgeEventEmitter()
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), emitter)
+	manager.SetTargetChannel([]string{"typo-channel"})
+	manager.managerConfig = &ConnectionManagerConfig{MaxRetries: 0, BaseRetryDelay: time.Millisecond, MaxRetryDelay: time.Millisecond, RetryMultiplier: 2}
+	manager.connectFunc = func() error { return errors.New("configured Mumble channel not found") }
+	manager.connectionLoop(context.Background())
+
+	assert.Equal(t, ConnectionFailed, manager.GetStatus())
+	for _, event := range emitter.GetEvents() {
+		assert.False(t, event.Connected, "missing configured channel must never emit Connected")
+	}
+}
+
+func TestMumble_EmptyChannelExplicitlyTargetsRoot(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	manager.SetTargetChannel(nil)
+	manager.configMutex.RLock()
+	defer manager.configMutex.RUnlock()
+	assert.Empty(t, manager.targetChannel)
+}
+
+func TestMumble_TargetChannelConfigurationIsCopied(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	path := []string{"parent", "voice"}
+	manager.SetTargetChannel(path)
+	path[1] = "mutated"
+	manager.configMutex.RLock()
+	defer manager.configMutex.RUnlock()
+	assert.Equal(t, []string{"parent", "voice"}, manager.targetChannel)
+}
+
+func TestMumble_StopClosedDisconnectChannelBoundary(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+		manager.connectFunc = func() error { return nil }
+		loopCtx, cancelLoop := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			manager.connectionLoop(loopCtx)
+			close(done)
+		}()
+
+		select {
+		case event := <-manager.GetEventChannel():
+			require.Equal(t, ConnectionConnected, event.Status)
+		case <-time.After(time.Second):
+			cancelLoop()
+			t.Fatalf("iteration %d did not reach disconnect wait", iteration)
+		}
+
+		require.NoError(t, manager.Stop())
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			cancelLoop()
+			t.Fatalf("iteration %d did not exit after disconnect channel close", iteration)
+		}
+		cancelLoop()
+	}
+}
 
 // TestMumble_DisconnectKickedStopsReconnection verifies kicked status stops reconnection
 func TestMumble_DisconnectKickedStopsReconnection(t *testing.T) {

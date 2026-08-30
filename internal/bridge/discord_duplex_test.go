@@ -10,6 +10,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	gopus "github.com/stieneee/gopus"
+	"github.com/stieneee/gumble/gumble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -55,6 +56,123 @@ func TestDiscordSendResult_NonRatchetErrorPreservesDebugBehavior(t *testing.T) {
 	assert.False(t, dd.handleDiscordSendResult(errors.New("ordinary send failure"), &ratchetMissing))
 	assert.False(t, ratchetMissing)
 	assert.True(t, mockLog.ContainsMessage("Error sending opus: ordinary send failure"))
+}
+
+func TestDiscordSendResult_ControlsCurrentReadiness(t *testing.T) {
+	bridge := createTestBridgeState(NewMockLogger())
+	bridge.BridgeMutex.Lock()
+	bridge.DiscordConnected = true
+	bridge.MumbleConnected = true
+	bridge.BridgeMutex.Unlock()
+	dd := NewDiscordDuplex(bridge)
+	ratchetMissing := false
+
+	assert.False(t, dd.handleDiscordSendResult(errors.New("send failed"), &ratchetMissing))
+	assert.False(t, bridge.IsConnected())
+	assert.Equal(t, discordOutboundUnhealthy, bridge.DiscordOutboundHealth)
+	assert.Equal(t, float64(discordOutboundUnhealthy), testutil.ToFloat64(promDiscordOutboundHealth))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing))
+	assert.True(t, bridge.IsConnected())
+	assert.Equal(t, discordOutboundHealthy, bridge.DiscordOutboundHealth)
+	assert.Equal(t, float64(discordOutboundHealthy), testutil.ToFloat64(promDiscordOutboundHealth))
+}
+
+func TestDiscordSender_NilVoiceConnectionMarksOutboundUnhealthy(t *testing.T) {
+	bridge := createTestBridgeState(nil)
+	bridge.BridgeMutex.Lock()
+	bridge.DiscordConnected = true
+	bridge.MumbleConnected = true
+	bridge.BridgeMutex.Unlock()
+	dd := NewDiscordDuplex(bridge)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		dd.toDiscordSender(ctx, make(chan []byte))
+		close(done)
+	}()
+	deadline := time.After(time.Second)
+	for {
+		bridge.BridgeMutex.Lock()
+		health := bridge.DiscordOutboundHealth
+		bridge.BridgeMutex.Unlock()
+		if health == discordOutboundUnhealthy {
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("nil voice connection did not degrade outbound health")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Discord sender did not stop")
+	}
+}
+
+func TestMixPCM_SaturatesAndCancels(t *testing.T) {
+	tests := []struct {
+		name    string
+		sources [][]int16
+		want    []int16
+	}{
+		{"positive overflow", [][]int16{{30000, 100}, {30000, -100}}, []int16{32767, 0}},
+		{"negative overflow", [][]int16{{-30000, 100}, {-30000, -100}}, []int16{-32768, 0}},
+		{"three sources cancellation", [][]int16{{20000}, {20000}, {-15000}}, []int16{25000}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, mixPCM(test.sources...))
+		})
+	}
+}
+
+func TestMumbleDuplex_MixOneChunkUsesSaturatingMixer(t *testing.T) {
+	mixer := NewMumbleDuplex(NewMockLogger(), createTestBridgeState(nil))
+	positive := make(chan gumble.AudioBuffer, 1)
+	negative := make(chan gumble.AudioBuffer, 1)
+	positive <- gumble.AudioBuffer{30000, -30000, 1000}
+	negative <- gumble.AudioBuffer{30000, -30000, -1000}
+	mixer.streams = []chan gumble.AudioBuffer{positive, negative}
+
+	mixed, count := mixer.MixOneChunk()
+	require.Equal(t, 2, count)
+	assert.Equal(t, []int16{32767, -32768, 0}, mixed)
+}
+
+func TestDiscordDuplex_FromDiscordMixerUsesSaturatingMixer(t *testing.T) {
+	bridge := createTestBridgeState(nil)
+	dd := NewDiscordDuplex(bridge)
+	first := make(chan []int16, 1)
+	second := make(chan []int16, 1)
+	first <- append([]int16{30000, -30000}, make([]int16, pcmChunkSize-2)...)
+	second <- append([]int16{30000, -30000}, make([]int16, pcmChunkSize-2)...)
+	dd.fromDiscordMap[1] = fromDiscord{pcm: first, streaming: true}
+	dd.fromDiscordMap[2] = fromDiscord{pcm: second, streaming: true}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	out := make(chan gumble.AudioBuffer, 1)
+	done := make(chan struct{})
+	go func() {
+		dd.fromDiscordMixer(ctx, out)
+		close(done)
+	}()
+	select {
+	case mixed := <-out:
+		assert.Equal(t, int16(32767), mixed[0])
+		assert.Equal(t, int16(-32768), mixed[1])
+	case <-time.After(time.Second):
+		t.Fatal("production Discord mixer did not emit")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("production Discord mixer did not stop")
+	}
 }
 
 // ---------------------------------------------------------------------------

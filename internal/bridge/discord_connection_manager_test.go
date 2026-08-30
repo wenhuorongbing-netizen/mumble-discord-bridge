@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -11,6 +12,66 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestDiscord_RetryBudgetEndsInFailed(t *testing.T) {
+	client := &mockDiscordClientForConn{}
+	mgr, _, _ := newTestDiscordManager(client)
+	mgr.config = &ConnectionManagerConfig{MaxRetries: 2, BaseRetryDelay: time.Millisecond, MaxRetryDelay: 2 * time.Millisecond, RetryMultiplier: 2}
+	attempts := 0
+	mgr.connectFunc = func() error {
+		attempts++
+		return errors.New("connect failed")
+	}
+	done := make(chan struct{})
+	go func() {
+		mgr.mainConnectionLoop(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Discord retry budget did not terminate")
+	}
+	assert.Equal(t, 3, attempts)
+	assert.Equal(t, ConnectionFailed, mgr.GetStatus())
+}
+
+func TestDiscord_RetryBudgetResetsAfterSuccess(t *testing.T) {
+	client := &mockDiscordClientForConn{}
+	mgr, _, _ := newTestDiscordManager(client)
+	mgr.config = &ConnectionManagerConfig{MaxRetries: 1, BaseRetryDelay: time.Millisecond, MaxRetryDelay: time.Millisecond, RetryMultiplier: 2}
+	attempts := 0
+	mgr.connectFunc = func() error {
+		attempts++
+		if attempts == 1 || attempts == 3 {
+			return errors.New("transient")
+		}
+		mgr.SetStatus(ConnectionConnected, nil)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	monitorCalls := 0
+	mgr.monitorFunc = func(ctx context.Context) {
+		monitorCalls++
+		if monitorCalls == 2 {
+			cancel()
+			<-ctx.Done()
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		mgr.mainConnectionLoop(ctx)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("Discord reset test did not terminate")
+	}
+	assert.Equal(t, 4, attempts, "each post-success episode must receive a fresh retry budget")
+	assert.Equal(t, 2, monitorCalls)
+}
 
 // ---------------------------------------------------------------------------
 // Mock types for Discord client and voice connection
@@ -49,6 +110,12 @@ func (m *mockDiscordClientForConn) IsReady() bool {
 	return m.ready
 }
 
+func (m *mockDiscordClientForConn) setReady(ready bool) {
+	m.mu.Lock()
+	m.ready = ready
+	m.mu.Unlock()
+}
+
 func (m *mockDiscordClientForConn) CreateVoiceConnection(_ string) (discord.VoiceConnection, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -57,19 +124,27 @@ func (m *mockDiscordClientForConn) CreateVoiceConnection(_ string) (discord.Voic
 
 // mockVoiceConn implements discord.VoiceConnection for connection manager tests.
 type mockVoiceConn struct {
-	ready        bool
-	gatewayReady bool
-	opened       bool
-	closed       bool
-	mu           sync.Mutex
-	openErr      error
+	ready         bool
+	gatewayReady  bool
+	opened        bool
+	closed        bool
+	mu            sync.Mutex
+	openErr       error
+	openedChannel string
 }
 
-func (m *mockVoiceConn) Open(_ context.Context, _ string) error {
+func (m *mockVoiceConn) Open(_ context.Context, channelID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.opened = true
+	m.openedChannel = channelID
 	return m.openErr
+}
+
+func (m *mockVoiceConn) getOpenedChannel() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.openedChannel
 }
 
 func (m *mockVoiceConn) Close(_ context.Context) error {
@@ -196,6 +271,36 @@ func TestDiscord_UpdateChannel(t *testing.T) {
 		mgr.UpdateChannel(fmt.Sprintf("channel-%d", i))
 	})
 
+	require.NoError(t, mgr.Stop())
+}
+
+func TestDiscord_ConnectUsesSingleChannelSnapshotDuringConcurrentUpdate(t *testing.T) {
+	voiceConn := &mockVoiceConn{}
+	client := &mockDiscordClientForConn{voiceConn: voiceConn}
+	mgr, log, _ := newTestDiscordManager(client)
+	mgr.InitContext(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- mgr.connectOnce()
+	}()
+
+	require.Eventually(t, func() bool {
+		return log.ContainsMessage("Channel=test-channel")
+	}, time.Second, time.Millisecond, "connect did not capture and log its initial channel")
+
+	runConcurrentlyWithTimeout(t, time.Second, 50, func(i int) {
+		mgr.UpdateChannel(fmt.Sprintf("updated-channel-%d", i))
+	})
+	mgr.UpdateChannel("new-target")
+	client.setReady(true)
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("connectOnce did not finish")
+	}
+	require.Equal(t, "test-channel", voiceConn.getOpenedChannel(), "log and Open must use one locked channel snapshot")
 	require.NoError(t, mgr.Stop())
 }
 
@@ -688,10 +793,7 @@ func TestDiscord_ConnectOnce_ClientNotReady(t *testing.T) {
 	}
 	mgr, _, _ := newTestDiscordManager(client)
 
-	// Use a short reconnect delay so the test finishes quickly.
-	mgr.baseReconnectDelay = 50 * time.Millisecond
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 
 	mgr.InitContext(ctx)
@@ -716,8 +818,8 @@ func TestDiscord_ConnectOnce_ClientNotReady(t *testing.T) {
 	}
 
 	status := mgr.GetStatus()
-	assert.Equal(t, ConnectionFailed, status,
-		"Status should be ConnectionFailed after connectOnce fails")
+	assert.Equal(t, ConnectionConnecting, status,
+		"a single connectOnce failure must not consume the loop's terminal retry decision")
 
 	require.NoError(t, mgr.Stop())
 }

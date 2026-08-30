@@ -190,10 +190,13 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 	internalSend := func(opus []byte) {
 		connManager := dd.Bridge.DiscordVoiceConnectionManager
 		if connManager == nil {
+			dd.Bridge.setDiscordOutboundHealth(discordOutboundUnhealthy)
+			promPacketsSunk.WithLabelValues("discord", "outbound").Inc()
 			return
 		}
 		voiceConn := connManager.GetVoiceConnection()
 		if voiceConn == nil {
+			dd.Bridge.setDiscordOutboundHealth(discordOutboundUnhealthy)
 			if lastReady {
 				dd.Bridge.Logger.Debug("DISCORD_SEND", "Discord connection not ready, sinking packet")
 				lastReady = false
@@ -315,6 +318,7 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 // from voice connection readiness and reports whether the packet was sent.
 func (dd *DiscordDuplex) handleDiscordSendResult(err error, ratchetMissing *bool) bool {
 	if err == nil {
+		dd.Bridge.setDiscordOutboundHealth(discordOutboundHealthy)
 		if *ratchetMissing {
 			dd.Bridge.Logger.Info("DISCORD_SEND", "Discord opus sender recovered from missing key ratchet")
 			*ratchetMissing = false
@@ -322,6 +326,7 @@ func (dd *DiscordDuplex) handleDiscordSendResult(err error, ratchetMissing *bool
 
 		return true
 	}
+	dd.Bridge.setDiscordOutboundHealth(discordOutboundUnhealthy)
 
 	if strings.Contains(err.Error(), "missing key ratchet") {
 		if !*ratchetMissing {
@@ -627,13 +632,7 @@ func (dd *DiscordDuplex) fromDiscordMixer(ctx context.Context, toMumble chan<- g
 
 		if sendAudio {
 			// Regular send mixed audio
-			outBuf := make([]int16, pcmChunkSize)
-
-			for j := 0; j < len(internalMixerArr); j++ {
-				for i := 0; i < len(internalMixerArr[j]); i++ {
-					outBuf[i] += (internalMixerArr[j])[i]
-				}
-			}
+			outBuf := mixPCM(internalMixerArr...)
 
 			mumbleTimeoutSend(outBuf)
 		} else if !sendAudio && toMumbleStreaming {

@@ -94,6 +94,15 @@ type BridgeConfig struct { //nolint:revive // API consistency: keeping Bridge pr
 	Version string
 }
 
+type discordOutboundHealth int
+
+const (
+	discordOutboundUnproven discordOutboundHealth = iota
+	discordOutboundHealthy
+	discordOutboundUnhealthy
+	discordOutboundInactive
+)
+
 // BridgeState manages dynamic information about the bridge during runtime.
 //
 // CONCURRENCY NOTES:
@@ -129,6 +138,8 @@ type BridgeState struct { //nolint:revive // API consistency: keeping Bridge pre
 	// Individual connection states
 	DiscordConnected bool
 	MumbleConnected  bool
+	// DiscordOutboundHealth is unproven until the active sender completes a SendOpus.
+	DiscordOutboundHealth discordOutboundHealth
 
 	// The bridge mode constant, auto, manual. Default is constant.
 	Mode BridgeMode
@@ -214,6 +225,29 @@ func (b *BridgeState) notifyMetricsChange() {
 	}
 }
 
+func (b *BridgeState) voiceOnlyPrivacy() bool {
+	config := b.BridgeConfig
+	return config != nil && config.DiscordTextMode == "disabled" && !config.DiscordCommand &&
+		!config.ChatBridge && config.MumbleDisableText && !config.MumbleCommand
+}
+
+func (b *BridgeState) setDiscordOutboundHealth(health discordOutboundHealth) {
+	b.BridgeMutex.Lock()
+	changed := b.DiscordOutboundHealth != health
+	b.DiscordOutboundHealth = health
+	promDiscordOutboundHealth.Set(float64(health))
+	b.updateOverallConnectionState()
+	b.BridgeMutex.Unlock()
+	if changed {
+		b.notifyMetricsChange()
+	}
+}
+
+func (b *BridgeState) readyLocked() bool {
+	return b.DiscordConnected && b.MumbleConnected &&
+		(b.DiscordOutboundHealth == discordOutboundHealthy || b.DiscordOutboundHealth == discordOutboundInactive)
+}
+
 // EmitConnectionEvent implements BridgeEventEmitter interface
 func (b *BridgeState) EmitConnectionEvent(service string, eventType int, connected bool, err error) {
 	// Forward the event to BridgeInstance if available (for bridgelib integration)
@@ -249,7 +283,7 @@ func (b *BridgeState) EmitConnectionEvent(service string, eventType int, connect
 	}
 
 	// Update overall connection state
-	b.Connected = b.DiscordConnected && b.MumbleConnected
+	b.Connected = b.readyLocked()
 
 	// Notify metrics change for event-driven updates
 	b.notifyMetricsChange()
@@ -308,6 +342,7 @@ func (b *BridgeState) initializeConnectionManagers() error {
 			b.Logger,
 			b, // BridgeState implements BridgeEventEmitter
 		)
+		b.MumbleConnectionManager.SetTargetChannel(b.BridgeConfig.MumbleChannel)
 		b.Logger.Debug("BRIDGE", "Mumble connection manager initialized")
 	} else {
 		return fmt.Errorf("mumble config not available")
@@ -489,7 +524,7 @@ func (b *BridgeState) handleMumbleConnectionEvent(event ConnectionEvent) {
 // This version requires the caller to hold the BridgeMutex.
 func (b *BridgeState) updateOverallConnectionState() {
 	oldConnected := b.Connected
-	b.Connected = b.DiscordConnected && b.MumbleConnected
+	b.Connected = b.readyLocked()
 
 	if oldConnected != b.Connected {
 		b.Logger.Info("BRIDGE", fmt.Sprintf("Overall bridge connection state changed: %v -> %v (Discord: %v, Mumble: %v)",
@@ -531,6 +566,10 @@ func (b *BridgeState) tryPresenceAnnouncement() {
 // sendPresenceAnnouncement sends a one-time message to each side listing users on the other side.
 // Runs in its own goroutine. No locks held on entry.
 func (b *BridgeState) sendPresenceAnnouncement() {
+	if b.voiceOnlyPrivacy() {
+		return
+	}
+
 	// Wait for the Mumble server to send the full channel user list.
 	// After Move(), the server responds asynchronously, so the MumbleUsers
 	// map is often still empty when the connection state first becomes ready.
@@ -609,6 +648,10 @@ func (b *BridgeState) sendPresenceAnnouncement() {
 // sendDisconnectAnnouncement sends "Bridge disconnected." to both Discord and Mumble.
 // Called before teardown while connections are still active.
 func (b *BridgeState) sendDisconnectAnnouncement() {
+	if b.voiceOnlyPrivacy() {
+		return
+	}
+
 	b.discordSendMessage("Bridge disconnected.")
 
 	if !b.BridgeConfig.MumbleDisableText {
@@ -755,6 +798,11 @@ func (b *BridgeState) populateExistingDiscordUsers() {
 			if exists {
 				b.Logger.Debug("BRIDGE", fmt.Sprintf("User %s already tracked", vs.UserID))
 
+				continue
+			}
+
+			if b.voiceOnlyPrivacy() {
+				newUsers = append(newUsers, newUser{userID: vs.UserID})
 				continue
 			}
 
@@ -920,6 +968,8 @@ func (b *BridgeState) StartBridge() {
 		return
 	}
 	b.BridgeActive = true
+	b.DiscordOutboundHealth = discordOutboundUnproven
+	promDiscordOutboundHealth.Set(float64(discordOutboundUnproven))
 	// Set StartTime while holding lock to prevent races
 	b.StartTime = time.Now()
 	b.presenceAnnounced = false
@@ -1216,6 +1266,16 @@ func (b *BridgeState) PopulateExistingDiscordUsers() {
 	// Pass 2: look up users via API (without lock)
 	count := 0
 	for _, userID := range newUserIDs {
+		if b.voiceOnlyPrivacy() {
+			b.DiscordUsersMutex.Lock()
+			if _, exists := b.DiscordUsers[userID]; !exists {
+				b.DiscordUsers[userID] = DiscordUser{seen: true}
+				count++
+			}
+			b.DiscordUsersMutex.Unlock()
+			continue
+		}
+
 		u, err := b.DiscordClient.GetUser(userID)
 		if err != nil {
 			b.Logger.Error("BRIDGE", fmt.Sprintf("Error looking up user %s: %v", userID, err))
@@ -1281,6 +1341,11 @@ func (b *BridgeState) refreshDiscordVoiceUsers() {
 	}
 	var newUsers []newUser
 	for _, uid := range newUserIDs {
+		if b.voiceOnlyPrivacy() {
+			newUsers = append(newUsers, newUser{userID: uid})
+			continue
+		}
+
 		u, err := b.DiscordClient.GetUser(uid)
 		if err != nil {
 			continue
@@ -1383,6 +1448,7 @@ func (b *BridgeState) MumblePresenceBridge() {
 		b.Logger,
 		b,
 	)
+	b.MumbleConnectionManager.SetTargetChannel(b.BridgeConfig.MumbleChannel)
 
 	mumbleCtx, mumbleCancel := context.WithCancel(context.Background())
 	defer mumbleCancel()
@@ -1581,6 +1647,8 @@ func (b *BridgeState) StartDiscordPresence() {
 		return
 	}
 	b.BridgeActive = true
+	b.DiscordOutboundHealth = discordOutboundInactive
+	promDiscordOutboundHealth.Set(float64(discordOutboundInactive))
 	b.StartTime = time.Now()
 	b.presenceAnnounced = false
 	b.BridgeMutex.Unlock()
@@ -1687,6 +1755,9 @@ func (b *BridgeState) startAudioPipeline() {
 		return
 	}
 	b.AudioActive = true
+	b.DiscordOutboundHealth = discordOutboundUnproven
+	promDiscordOutboundHealth.Set(float64(discordOutboundUnproven))
+	b.updateOverallConnectionState()
 	b.presenceAnnounced = false
 	b.BridgeMutex.Unlock()
 
@@ -1767,6 +1838,9 @@ func (b *BridgeState) stopAudioPipeline() {
 		return
 	}
 	b.AudioActive = false
+	b.DiscordOutboundHealth = discordOutboundInactive
+	promDiscordOutboundHealth.Set(float64(discordOutboundInactive))
+	b.updateOverallConnectionState()
 	b.BridgeMutex.Unlock()
 
 	// Send disconnect announcement while connections are still active

@@ -17,11 +17,13 @@ import (
 // ---------------------------------------------------------------------------
 
 type mockDiscordClient struct {
-	botUserID    string
-	guild        *discord.Guild
-	ready        bool
-	mu           sync.Mutex
-	sentMessages []struct{ channelID, content string }
+	botUserID     string
+	guild         *discord.Guild
+	ready         bool
+	mu            sync.Mutex
+	sentMessages  []struct{ channelID, content string }
+	getUserCalls  int
+	createDMCalls int
 }
 
 func (m *mockDiscordClient) Connect(_ context.Context) error { return nil }
@@ -36,10 +38,16 @@ func (m *mockDiscordClient) SendMessage(channelID, content string) error {
 }
 
 func (m *mockDiscordClient) GetUser(userID string) (*discord.User, error) {
+	m.mu.Lock()
+	m.getUserCalls++
+	m.mu.Unlock()
 	return &discord.User{ID: userID, Username: "user-" + userID}, nil
 }
 
 func (m *mockDiscordClient) CreateDM(userID string) (string, error) {
+	m.mu.Lock()
+	m.createDMCalls++
+	m.mu.Unlock()
 	return "dm-" + userID, nil
 }
 
@@ -573,6 +581,12 @@ func TestMessageCreate_CommandFromCorrectChannel(t *testing.T) {
 	assert.Equal(t, bs.BridgeConfig.CID, msgs[0].channelID, "response should be sent to the configured channel")
 }
 
+func (m *mockDiscordClient) lookupCalls() (int, int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.getUserCalls, m.createDMCalls
+}
+
 func TestMessageCreate_DisabledChatDoesNotLeakMessageData(t *testing.T) {
 	l, bs, mc := setupDiscordHandlerTest(nil)
 	bs.BridgeConfig.ChatBridge = false
@@ -594,4 +608,67 @@ func TestMessageCreate_DisabledChatDoesNotLeakMessageData(t *testing.T) {
 	}
 	assert.True(t, mockLog.ContainsMessage("Discord chat message ignored because ChatBridge is disabled"))
 	assert.Empty(t, mc.getSentMessages())
+}
+
+func TestVoiceOnly_GuildCreateTracksMembershipWithoutUserOrDM(t *testing.T) {
+	l, bs, mc := setupDiscordHandlerTest(nil)
+	bs.BridgeConfig.DiscordTextMode = "disabled"
+	bs.BridgeConfig.MumbleDisableText = true
+
+	l.OnGuildCreate(&discord.Guild{
+		ID: bs.BridgeConfig.GID,
+		VoiceStates: []discord.VoiceState{
+			{UserID: "privacy-user", ChannelID: bs.DiscordChannelID, GuildID: bs.BridgeConfig.GID},
+		},
+	})
+
+	getUser, createDM := mc.lookupCalls()
+	assert.Zero(t, getUser)
+	assert.Zero(t, createDM)
+	bs.DiscordUsersMutex.Lock()
+	user, exists := bs.DiscordUsers["privacy-user"]
+	bs.DiscordUsersMutex.Unlock()
+	assert.True(t, exists, "voice membership must still be tracked")
+	assert.Empty(t, user.username)
+	assert.Empty(t, user.dmID)
+}
+
+func TestVoiceOnly_VoiceUpdateAvoidsIdentityCallsAndPlaintextLogs(t *testing.T) {
+	l, bs, mc := setupDiscordHandlerTest([]discord.VoiceState{
+		{UserID: "privacy-canary", ChannelID: "test-channel-id", GuildID: "test-guild-id"},
+	})
+	bs.BridgeConfig.DiscordTextMode = "disabled"
+	bs.BridgeConfig.MumbleDisableText = true
+	bs.DiscordUserChange = make(chan struct{}, 1)
+
+	l.OnVoiceStateUpdate(&discord.VoiceState{UserID: "privacy-canary", ChannelID: bs.DiscordChannelID, GuildID: bs.BridgeConfig.GID})
+
+	getUser, createDM := mc.lookupCalls()
+	assert.Zero(t, getUser)
+	assert.Zero(t, createDM)
+	bs.DiscordUsersMutex.Lock()
+	_, exists := bs.DiscordUsers["privacy-canary"]
+	bs.DiscordUsersMutex.Unlock()
+	assert.True(t, exists)
+	select {
+	case <-bs.DiscordUserChange:
+	default:
+		t.Fatal("voice membership change signal was not preserved")
+	}
+	for _, entry := range bs.Logger.(*MockLogger).GetEntries() {
+		assert.NotContains(t, entry.Message, "privacy-canary")
+	}
+}
+
+func TestGeneralMode_GuildCreatePreservesUserAndDMCompatibility(t *testing.T) {
+	l, bs, mc := setupDiscordHandlerTest(nil)
+	l.OnGuildCreate(&discord.Guild{
+		ID: bs.BridgeConfig.GID,
+		VoiceStates: []discord.VoiceState{
+			{UserID: "general-user", ChannelID: bs.DiscordChannelID, GuildID: bs.BridgeConfig.GID},
+		},
+	})
+	getUser, createDM := mc.lookupCalls()
+	assert.Equal(t, 1, getUser)
+	assert.Equal(t, 1, createDM)
 }

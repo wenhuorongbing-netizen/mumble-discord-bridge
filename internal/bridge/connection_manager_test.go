@@ -10,6 +10,36 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type blockingConnectionEventEmitter struct {
+	mu      sync.Mutex
+	events  []int
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingConnectionEventEmitter) EmitConnectionEvent(_ string, eventType int, _ bool, _ error) {
+	e.mu.Lock()
+	e.events = append(e.events, eventType)
+	first := len(e.events) == 1
+	e.mu.Unlock()
+	if first {
+		close(e.entered)
+		<-e.release
+	}
+}
+
+func TestConnectionManager_RetryDelayIsCapped(t *testing.T) {
+	config := &ConnectionManagerConfig{BaseRetryDelay: 2 * time.Millisecond, MaxRetryDelay: 5 * time.Millisecond, RetryMultiplier: 2}
+	assert.Equal(t, 2*time.Millisecond, retryDelay(config, 0))
+	assert.Equal(t, 4*time.Millisecond, retryDelay(config, 1))
+	assert.Equal(t, 5*time.Millisecond, retryDelay(config, 2))
+	assert.Equal(t, 5*time.Millisecond, retryDelay(config, 20))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.False(t, waitRetry(ctx, time.Hour), "retry wait must preserve cancellation")
+}
+
 // TestConnectionManager_StateTransitions verifies all valid state transitions
 func TestConnectionManager_StateTransitions(t *testing.T) {
 	logger := NewMockLogger()
@@ -80,6 +110,63 @@ func TestConnectionManager_ConcurrentStatusUpdates(t *testing.T) {
 	// Verify events were emitted (at least some)
 	events := emitter.GetEvents()
 	assert.NotEmpty(t, events, "Expected events to be emitted during concurrent updates")
+}
+
+func TestConnectionManager_ConcurrentTransitionsPublishInStatusOrder(t *testing.T) {
+	emitter := &blockingConnectionEventEmitter{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	cm := NewBaseConnectionManager(NewMockLogger(), "test", emitter)
+	firstDone := make(chan struct{})
+	go func() {
+		cm.SetStatus(ConnectionConnecting, nil)
+		close(firstDone)
+	}()
+
+	select {
+	case <-emitter.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first transition did not reach event publication")
+	}
+	require.Equal(t, ConnectionConnecting, cm.GetStatus())
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		cm.SetStatus(ConnectionConnected, nil)
+		close(secondDone)
+	}()
+	<-secondStarted
+	select {
+	case <-secondDone:
+		t.Fatal("second transition completed before first publication")
+	case <-time.After(20 * time.Millisecond):
+	}
+	require.Equal(t, ConnectionConnecting, cm.GetStatus(), "current status advanced ahead of serialized publication")
+
+	close(emitter.release)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first transition did not complete")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second transition did not complete")
+	}
+
+	firstEvent := <-cm.GetEventChannel()
+	secondEvent := <-cm.GetEventChannel()
+	require.Equal(t, ConnectionConnecting, firstEvent.Status)
+	require.Equal(t, ConnectionConnected, secondEvent.Status)
+	require.Equal(t, ConnectionConnected, cm.GetStatus())
+	emitter.mu.Lock()
+	require.Equal(t, []int{0, 1}, append([]int(nil), emitter.events...))
+	emitter.mu.Unlock()
+	require.NoError(t, cm.Stop())
 }
 
 // TestConnectionManager_EventChannelDrain ensures events are processed before Stop completes

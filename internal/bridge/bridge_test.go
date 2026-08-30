@@ -190,6 +190,7 @@ func TestBridge_UpdateOverallConnectionState(t *testing.T) {
 			bridge.Mode = tc.mode
 			bridge.DiscordConnected = tc.discord
 			bridge.MumbleConnected = tc.mumble
+			bridge.DiscordOutboundHealth = discordOutboundHealthy
 			bridge.updateOverallConnectionState()
 			result := bridge.Connected
 			bridge.BridgeMutex.Unlock()
@@ -197,6 +198,45 @@ func TestBridge_UpdateOverallConnectionState(t *testing.T) {
 			assert.Equal(t, tc.expectedConn, result)
 		})
 	}
+}
+
+func TestBridge_OutboundHealthReadinessModel(t *testing.T) {
+	bridge := createTestBridgeState(nil)
+	bridge.BridgeMutex.Lock()
+	bridge.DiscordConnected = true
+	bridge.MumbleConnected = true
+	bridge.updateOverallConnectionState()
+	assert.False(t, bridge.Connected, "active startup is fail-closed until the first successful send")
+	bridge.BridgeMutex.Unlock()
+
+	bridge.setDiscordOutboundHealth(discordOutboundHealthy)
+	assert.True(t, bridge.IsConnected())
+	bridge.setDiscordOutboundHealth(discordOutboundUnhealthy)
+	assert.False(t, bridge.IsConnected())
+	bridge.setDiscordOutboundHealth(discordOutboundHealthy)
+	assert.True(t, bridge.IsConnected())
+
+	bridge.setDiscordOutboundHealth(discordOutboundInactive)
+	assert.True(t, bridge.IsConnected(), "intentional no-audio presence must not be permanently unready")
+}
+
+func TestBridge_VoiceOnlyPrivacyPredicateIsNarrow(t *testing.T) {
+	bridge := createTestBridgeState(nil)
+	bridge.BridgeConfig.DiscordTextMode = "disabled"
+	bridge.BridgeConfig.MumbleDisableText = true
+	assert.True(t, bridge.voiceOnlyPrivacy())
+
+	bridge.BridgeConfig.DiscordTextMode = "channel"
+	assert.False(t, bridge.voiceOnlyPrivacy())
+	bridge.BridgeConfig.DiscordTextMode = "disabled"
+	bridge.BridgeConfig.DiscordCommand = true
+	assert.False(t, bridge.voiceOnlyPrivacy())
+	bridge.BridgeConfig.DiscordCommand = false
+	bridge.BridgeConfig.ChatBridge = true
+	assert.False(t, bridge.voiceOnlyPrivacy())
+	bridge.BridgeConfig.ChatBridge = false
+	bridge.BridgeConfig.MumbleDisableText = false
+	assert.False(t, bridge.voiceOnlyPrivacy())
 }
 
 // TestBridge_EmitConnectionEvent tests event emission

@@ -131,7 +131,8 @@ type BaseConnectionManager struct {
 	stopped    bool
 	closedChan chan struct{} // Signal channel to prevent sends after close
 
-	eventMutex sync.Mutex // Protects eventChan send/close to prevent data race
+	transitionMutex sync.Mutex // Serializes status changes and their publication order
+	eventMutex      sync.Mutex // Protects eventChan send/close to prevent data race
 }
 
 // NewBaseConnectionManager creates a new base connection manager
@@ -158,75 +159,80 @@ func (b *BaseConnectionManager) SetStatus(status ConnectionStatus, err error) {
 	default:
 	}
 
+	// Serialize each transition through both publication paths. eventMutex is
+	// held only around state/eventChan work so external emitters cannot block Stop.
+	b.transitionMutex.Lock()
+	defer b.transitionMutex.Unlock()
+	b.eventMutex.Lock()
+	select {
+	case <-b.closedChan:
+		b.eventMutex.Unlock()
+		return
+	default:
+	}
+
 	b.statusMutex.Lock()
 	oldStatus := b.status
+	if oldStatus == status {
+		b.statusMutex.Unlock()
+		b.eventMutex.Unlock()
+		return
+	}
 	b.status = status
 	b.statusMutex.Unlock()
 
-	if oldStatus != status {
-		eventType := b.statusToEventType(status)
-		event := ConnectionEvent{
-			Type:   eventType,
-			Status: status,
-			Error:  err,
-		}
-
-		// Guard send with eventMutex to prevent race with Stop() closing eventChan
-		b.eventMutex.Lock()
-		select {
-		case <-b.closedChan:
-			b.eventMutex.Unlock()
-
-			return // Manager stopping, don't send events
-		default:
-		}
-
-		select {
-		case b.eventChan <- event:
-		default:
-			// Event channel is full - try to drop oldest event and add new one
-			select {
-			case <-b.eventChan:
-				// Successfully dropped oldest event, try to add new one
-				select {
-				case b.eventChan <- event:
-				default:
-					b.logger.Warn("CONNECTION", "Event channel still full after dropping oldest event")
-				}
-			default:
-				b.logger.Warn("CONNECTION", "Event channel full or closed, dropping event")
-			}
-		}
-		b.eventMutex.Unlock()
-
-		// Emit bridge-level event if emitter is available
-		if b.eventEmitter != nil {
-			var bridgeEventType int
-			var connected bool
-
-			switch status {
-			case ConnectionConnecting:
-				bridgeEventType = 0 // EventDiscordConnecting or EventMumbleConnecting
-				connected = false
-			case ConnectionConnected:
-				bridgeEventType = 1 // EventDiscordConnected or EventMumbleConnected
-				connected = true
-			case ConnectionDisconnected:
-				bridgeEventType = 2 // EventDiscordDisconnected or EventMumbleDisconnected
-				connected = false
-			case ConnectionReconnecting:
-				bridgeEventType = 3 // EventDiscordReconnecting or EventMumbleReconnecting
-				connected = false
-			case ConnectionFailed:
-				bridgeEventType = 4 // EventDiscordConnectionFailed or EventMumbleConnectionFailed
-				connected = false
-			}
-
-			b.eventEmitter.EmitConnectionEvent(b.serviceName, bridgeEventType, connected, err)
-		}
-
-		b.logger.Debug("CONNECTION", fmt.Sprintf("%s status changed: %s -> %s", b.serviceName, oldStatus, status))
+	eventType := b.statusToEventType(status)
+	event := ConnectionEvent{
+		Type:   eventType,
+		Status: status,
+		Error:  err,
 	}
+
+	select {
+	case b.eventChan <- event:
+	default:
+		// Event channel is full - try to drop oldest event and add new one
+		select {
+		case <-b.eventChan:
+			// Successfully dropped oldest event, try to add new one
+			select {
+			case b.eventChan <- event:
+			default:
+				b.logger.Warn("CONNECTION", "Event channel still full after dropping oldest event")
+			}
+		default:
+			b.logger.Warn("CONNECTION", "Event channel full or closed, dropping event")
+		}
+	}
+	b.eventMutex.Unlock()
+
+	// Emit bridge-level event if emitter is available
+	if b.eventEmitter != nil {
+		var bridgeEventType int
+		var connected bool
+
+		switch status {
+		case ConnectionConnecting:
+			bridgeEventType = 0 // EventDiscordConnecting or EventMumbleConnecting
+			connected = false
+		case ConnectionConnected:
+			bridgeEventType = 1 // EventDiscordConnected or EventMumbleConnected
+			connected = true
+		case ConnectionDisconnected:
+			bridgeEventType = 2 // EventDiscordDisconnected or EventMumbleDisconnected
+			connected = false
+		case ConnectionReconnecting:
+			bridgeEventType = 3 // EventDiscordReconnecting or EventMumbleReconnecting
+			connected = false
+		case ConnectionFailed:
+			bridgeEventType = 4 // EventDiscordConnectionFailed or EventMumbleConnectionFailed
+			connected = false
+		}
+
+		b.eventEmitter.EmitConnectionEvent(b.serviceName, bridgeEventType, connected, err)
+	}
+
+	b.logger.Debug("CONNECTION", fmt.Sprintf("%s status changed: %s -> %s", b.serviceName, oldStatus, status))
 }
 
 // GetStatus returns the current connection status
@@ -318,5 +324,34 @@ func DefaultConnectionManagerConfig() *ConnectionManagerConfig {
 		MaxRetryDelay:       time.Minute * 2,
 		RetryMultiplier:     2.0,
 		HealthCheckInterval: time.Second * 30,
+	}
+}
+
+func retryDelay(config *ConnectionManagerConfig, retry int) time.Duration {
+	if config == nil {
+		config = DefaultConnectionManagerConfig()
+	}
+	delay := config.BaseRetryDelay
+	for attempt := 0; attempt < retry; attempt++ {
+		next := time.Duration(float64(delay) * config.RetryMultiplier)
+		if next <= delay || next > config.MaxRetryDelay {
+			return config.MaxRetryDelay
+		}
+		delay = next
+	}
+	if delay > config.MaxRetryDelay {
+		return config.MaxRetryDelay
+	}
+	return delay
+}
+
+func waitRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }

@@ -35,6 +35,13 @@ func (l *DiscordListener) OnGuildCreate(guild *discord.Guild) {
 				// Ignore bot
 				continue
 			}
+			if l.Bridge.voiceOnlyPrivacy() {
+				l.Bridge.DiscordUsersMutex.Lock()
+				l.Bridge.DiscordUsers[vs.UserID] = DiscordUser{seen: true}
+				l.Bridge.DiscordUsersMutex.Unlock()
+				l.Bridge.notifyMetricsChange()
+				continue
+			}
 
 			u, err := l.Bridge.DiscordClient.GetUser(vs.UserID)
 			if err != nil {
@@ -389,6 +396,11 @@ func (l *DiscordListener) OnVoiceStateUpdate(state *discord.VoiceState) {
 				}
 
 				if _, ok := l.Bridge.DiscordUsers[vs.UserID]; !ok {
+					if l.Bridge.voiceOnlyPrivacy() {
+						l.Bridge.DiscordUsers[vs.UserID] = DiscordUser{seen: true}
+						usersToAdd = append(usersToAdd, userToAdd{userID: vs.UserID})
+						continue
+					}
 					u, err := l.Bridge.DiscordClient.GetUser(vs.UserID)
 					if err != nil {
 						l.Bridge.Logger.Error("DISCORD_HANDLER", "Error looking up username")
@@ -425,8 +437,10 @@ func (l *DiscordListener) OnVoiceStateUpdate(state *discord.VoiceState) {
 		for id := range l.Bridge.DiscordUsers {
 			if !l.Bridge.DiscordUsers[id].seen {
 				username := l.Bridge.DiscordUsers[id].username
-				l.Bridge.Logger.Info("DISCORD_HANDLER", fmt.Sprintf("User left Discord channel: %s", username))
-				l.Bridge.EmitUserEvent("discord", 1, username, nil)
+				if !l.Bridge.voiceOnlyPrivacy() {
+					l.Bridge.Logger.Info("DISCORD_HANDLER", fmt.Sprintf("User left Discord channel: %s", username))
+					l.Bridge.EmitUserEvent("discord", 1, username, nil)
+				}
 				usersToRemove = append(usersToRemove, userToRemove{userID: id, username: username})
 			}
 		}
@@ -438,34 +452,41 @@ func (l *DiscordListener) OnVoiceStateUpdate(state *discord.VoiceState) {
 		if state.ChannelID == l.Bridge.DiscordChannelID {
 			// User joined or is in our channel
 			if _, ok := l.Bridge.DiscordUsers[state.UserID]; !ok {
-				u, err := l.Bridge.DiscordClient.GetUser(state.UserID)
-				if err != nil {
-					l.Bridge.Logger.Error("DISCORD_HANDLER", "Error looking up username")
+				if l.Bridge.voiceOnlyPrivacy() {
+					l.Bridge.DiscordUsers[state.UserID] = DiscordUser{seen: true}
+					usersToAdd = append(usersToAdd, userToAdd{userID: state.UserID})
 				} else {
-					l.Bridge.Logger.Info("DISCORD_HANDLER", fmt.Sprintf("User joined Discord: %s", u.Username))
-					l.Bridge.EmitUserEvent("discord", 0, u.Username, nil)
-
-					dmID, err := l.Bridge.DiscordClient.CreateDM(u.ID)
+					u, err := l.Bridge.DiscordClient.GetUser(state.UserID)
 					if err != nil {
-						l.Bridge.Logger.Error("DISCORD_HANDLER", fmt.Sprintf("Error creating private channel for %s", u.Username))
+						l.Bridge.Logger.Error("DISCORD_HANDLER", "Error looking up username")
+					} else {
+						l.Bridge.Logger.Info("DISCORD_HANDLER", fmt.Sprintf("User joined Discord: %s", u.Username))
+						l.Bridge.EmitUserEvent("discord", 0, u.Username, nil)
+
+						dmID, err := l.Bridge.DiscordClient.CreateDM(u.ID)
+						if err != nil {
+							l.Bridge.Logger.Error("DISCORD_HANDLER", fmt.Sprintf("Error creating private channel for %s", u.Username))
+						}
+						l.Bridge.DiscordUsers[state.UserID] = DiscordUser{
+							username: u.Username,
+							seen:     true,
+							dmID:     dmID,
+						}
+						usersToAdd = append(usersToAdd, userToAdd{
+							userID:   state.UserID,
+							username: u.Username,
+							dmID:     dmID,
+						})
 					}
-					l.Bridge.DiscordUsers[state.UserID] = DiscordUser{
-						username: u.Username,
-						seen:     true,
-						dmID:     dmID,
-					}
-					usersToAdd = append(usersToAdd, userToAdd{
-						userID:   state.UserID,
-						username: u.Username,
-						dmID:     dmID,
-					})
 				}
 			}
 		} else {
 			// User left our channel (moved elsewhere or disconnected)
 			if du, ok := l.Bridge.DiscordUsers[state.UserID]; ok {
-				l.Bridge.Logger.Info("DISCORD_HANDLER", fmt.Sprintf("User left Discord channel: %s", du.username))
-				l.Bridge.EmitUserEvent("discord", 1, du.username, nil)
+				if !l.Bridge.voiceOnlyPrivacy() {
+					l.Bridge.Logger.Info("DISCORD_HANDLER", fmt.Sprintf("User left Discord channel: %s", du.username))
+					l.Bridge.EmitUserEvent("discord", 1, du.username, nil)
+				}
 				usersToRemove = append(usersToRemove, userToRemove{userID: state.UserID, username: du.username})
 				delete(l.Bridge.DiscordUsers, state.UserID)
 			}

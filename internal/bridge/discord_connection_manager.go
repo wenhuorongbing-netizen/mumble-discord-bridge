@@ -22,21 +22,25 @@ type DiscordVoiceConnectionManager struct {
 	channelID     string
 	connMutex     sync.RWMutex
 
-	// Simple configuration
-	baseReconnectDelay time.Duration
+	config      *ConnectionManagerConfig
+	connectFunc func() error
+	monitorFunc func(context.Context)
 }
 
 // NewDiscordVoiceConnectionManager creates a new Discord connection manager
 func NewDiscordVoiceConnectionManager(client discord.Client, guildID, channelID string, logger logger.Logger, eventEmitter BridgeEventEmitter) *DiscordVoiceConnectionManager {
 	base := NewBaseConnectionManager(logger, "discord", eventEmitter)
 
-	return &DiscordVoiceConnectionManager{
+	manager := &DiscordVoiceConnectionManager{
 		BaseConnectionManager: base,
 		discordClient:         client,
 		guildID:               guildID,
 		channelID:             channelID,
-		baseReconnectDelay:    2 * time.Second,
+		config:                DefaultConnectionManagerConfig(),
 	}
+	manager.connectFunc = manager.connectOnce
+	manager.monitorFunc = manager.monitorConnection
+	return manager
 }
 
 // Start runs the main connection loop
@@ -63,6 +67,7 @@ func (d *DiscordVoiceConnectionManager) UpdateChannel(channelID string) {
 func (d *DiscordVoiceConnectionManager) mainConnectionLoop(ctx context.Context) {
 	defer d.logger.Info("DISCORD_CONN", "Main connection loop exiting")
 
+	retries := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -73,22 +78,25 @@ func (d *DiscordVoiceConnectionManager) mainConnectionLoop(ctx context.Context) 
 		default:
 			d.logger.Debug("DISCORD_CONN", "Attempting to establish voice connection")
 
-			if err := d.connectOnce(); err != nil {
+			if err := d.connectFunc(); err != nil {
 				d.logger.Error("DISCORD_CONN", fmt.Sprintf("Connection attempt failed: %v", err))
-				d.SetStatus(ConnectionFailed, err)
-
-				// Wait before retrying
-				select {
-				case <-ctx.Done():
+				if retries >= d.config.MaxRetries {
+					d.SetStatus(ConnectionFailed, err)
 					return
-				case <-time.After(d.baseReconnectDelay):
-					continue
 				}
+				d.SetStatus(ConnectionReconnecting, err)
+				delay := retryDelay(d.config, retries)
+				retries++
+				if !waitRetry(ctx, delay) {
+					return
+				}
+				continue
 			}
 
 			// Connection successful — monitor status
+			retries = 0
 			d.logger.Info("DISCORD_CONN", "Voice connection established, entering monitoring loop")
-			d.monitorConnection(ctx)
+			d.monitorFunc(ctx)
 
 			// Monitor exited due to safety timeout or context cancellation
 			d.logger.Warn("DISCORD_CONN", "Connection monitoring exited, forcing full reconnect")
@@ -147,20 +155,19 @@ func (d *DiscordVoiceConnectionManager) monitorConnection(ctx context.Context) {
 // connectOnce establishes a Discord voice connection
 func (d *DiscordVoiceConnectionManager) connectOnce() error {
 	d.SetStatus(ConnectionConnecting, nil)
-	d.logger.Debug("DISCORD_CONN", fmt.Sprintf("Connecting to Discord voice: Guild=%s, Channel=%s", d.guildID, d.channelID))
+	d.connMutex.RLock()
+	channelID := d.channelID
+	d.connMutex.RUnlock()
+	d.logger.Debug("DISCORD_CONN", fmt.Sprintf("Connecting to Discord voice: Guild=%s, Channel=%s", d.guildID, channelID))
 
 	// Wait for client to be ready
 	if err := d.waitForClientReady(10 * time.Second); err != nil {
-		d.SetStatus(ConnectionFailed, err)
-
 		return fmt.Errorf("client not ready: %w", err)
 	}
 
 	// Create voice connection
 	voiceConn, err := d.discordClient.CreateVoiceConnection(d.guildID)
 	if err != nil {
-		d.SetStatus(ConnectionFailed, err)
-
 		return fmt.Errorf("failed to create voice connection: %w", err)
 	}
 
@@ -170,10 +177,8 @@ func (d *DiscordVoiceConnectionManager) connectOnce() error {
 	openCtx, openCancel := context.WithTimeout(d.ctx, connectionTimeout)
 	defer openCancel()
 
-	if err := voiceConn.Open(openCtx, d.channelID); err != nil {
+	if err := voiceConn.Open(openCtx, channelID); err != nil {
 		d.logger.Error("DISCORD_CONN", fmt.Sprintf("Voice connection failed: %v", err))
-		d.SetStatus(ConnectionFailed, err)
-
 		return fmt.Errorf("failed to join voice channel: %w", err)
 	}
 

@@ -78,12 +78,18 @@ func (l *MumbleListener) updateUsers() {
 
 // MumbleConnect handles Mumble connection events.
 func (l *MumbleListener) MumbleConnect(e *gumble.ConnectEvent) {
-	l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("Connected to Mumble server: %s", e.Client.Conn.RemoteAddr()))
+	if l.Bridge.voiceOnlyPrivacy() {
+		l.Bridge.Logger.Info("MUMBLE_HANDLER", "Connected to Mumble server")
+	} else {
+		l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("Connected to Mumble server: %s", e.Client.Conn.RemoteAddr()))
+	}
 
 	// Log client info using thread-safe access
 	e.Client.Do(func() {
 		if e.Client.Self != nil {
-			l.Bridge.Logger.Debug("MUMBLE_HANDLER", fmt.Sprintf("Mumble client info: Username=%s, SessionID=%d", e.Client.Self.Name, e.Client.Self.Session))
+			if !l.Bridge.voiceOnlyPrivacy() {
+				l.Bridge.Logger.Debug("MUMBLE_HANDLER", fmt.Sprintf("Mumble client info: Username=%s, SessionID=%d", e.Client.Self.Name, e.Client.Self.Session))
+			}
 		}
 	})
 
@@ -97,10 +103,12 @@ func (l *MumbleListener) MumbleConnect(e *gumble.ConnectEvent) {
 			if startingChannel != nil {
 				l.Bridge.Logger.Debug("MUMBLE_HANDLER", fmt.Sprintf("Found target channel (ID: %d, Name: %s), moving to it", startingChannel.ID, startingChannel.Name))
 				e.Client.Self.Move(startingChannel)
-				l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("Successfully moved to Mumble channel: %s", channelPath))
+				l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("Requested move to Mumble channel: %s", channelPath))
 			} else {
-				l.Bridge.Logger.Warn("MUMBLE_HANDLER", fmt.Sprintf("Target Mumble channel not found: %s, staying in root channel", channelPath))
-				l.logAvailableChannels(e.Client)
+				l.Bridge.Logger.Error("MUMBLE_HANDLER", fmt.Sprintf("Target Mumble channel not found: %s; connection will fail closed", channelPath))
+				if !l.Bridge.voiceOnlyPrivacy() {
+					l.logAvailableChannels(e.Client)
+				}
 			}
 		})
 	} else {
@@ -126,10 +134,18 @@ func (l *MumbleListener) MumbleUserChange(e *gumble.UserChangeEvent) {
 	l.updateUsers()
 
 	if e.Type.Has(gumble.UserChangeConnected) {
-		l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("User connected to mumble: %s", e.User.Name))
+		if l.Bridge.voiceOnlyPrivacy() {
+			l.Bridge.Logger.Info("MUMBLE_HANDLER", "Mumble user connected")
+		} else {
+			l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("User connected to mumble: %s", e.User.Name))
+		}
 
 		// Emit user joined event
-		l.Bridge.EmitUserEvent("mumble", 0, e.User.Name, nil)
+		if l.Bridge.voiceOnlyPrivacy() {
+			l.Bridge.EmitUserEvent("mumble", 0, "", nil)
+		} else {
+			l.Bridge.EmitUserEvent("mumble", 0, e.User.Name, nil)
+		}
 
 		if !l.Bridge.BridgeConfig.MumbleDisableText {
 			e.User.Send("Mumble-Discord-Bridge " + l.Bridge.BridgeConfig.Version)
@@ -154,15 +170,27 @@ func (l *MumbleListener) MumbleUserChange(e *gumble.UserChangeEvent) {
 		}
 
 		// Send discord a notice
-		l.Bridge.discordSendMessage(e.User.Name + " has joined mumble")
+		if !l.Bridge.voiceOnlyPrivacy() {
+			l.Bridge.discordSendMessage(e.User.Name + " has joined mumble")
+		}
 	}
 
 	if e.Type.Has(gumble.UserChangeDisconnected) {
-		l.Bridge.discordSendMessage(e.User.Name + " has left mumble")
-		l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("User disconnected from mumble: %s", e.User.Name))
+		if !l.Bridge.voiceOnlyPrivacy() {
+			l.Bridge.discordSendMessage(e.User.Name + " has left mumble")
+		}
+		if l.Bridge.voiceOnlyPrivacy() {
+			l.Bridge.Logger.Info("MUMBLE_HANDLER", "Mumble user disconnected")
+		} else {
+			l.Bridge.Logger.Info("MUMBLE_HANDLER", fmt.Sprintf("User disconnected from mumble: %s", e.User.Name))
+		}
 
 		// Emit user left event
-		l.Bridge.EmitUserEvent("mumble", 1, e.User.Name, nil)
+		if l.Bridge.voiceOnlyPrivacy() {
+			l.Bridge.EmitUserEvent("mumble", 1, "", nil)
+		} else {
+			l.Bridge.EmitUserEvent("mumble", 1, e.User.Name, nil)
+		}
 	}
 }
 

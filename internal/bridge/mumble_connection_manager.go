@@ -20,7 +20,7 @@ type MumbleConnectionManager struct {
 	address            string
 	tlsConfig          *tls.Config
 	clientMutex        sync.RWMutex
-	configMutex        sync.RWMutex                 // Protects address, config, and tlsConfig
+	configMutex        sync.RWMutex                 // Protects address, config, tlsConfig, and targetChannel
 	disconnectCh       chan *gumble.DisconnectEvent // Channel to signal disconnection events
 	disconnectMux      sync.Mutex                   // Protects disconnectCh and disconnectChClosed
 	disconnectChClosed bool                         // Flag to track if disconnectCh is closed
@@ -30,6 +30,9 @@ type MumbleConnectionManager struct {
 	// per client. The caller (toMumbleSender) detects reconnections by comparing channel pointers
 	// and closes the stale channel to clean up gumble's goroutine.
 	audioOutgoing chan<- gumble.AudioBuffer // Protected by clientMutex
+	managerConfig *ConnectionManagerConfig
+	connectFunc   func() error
+	targetChannel []string
 }
 
 // NewMumbleConnectionManager creates a new Mumble connection manager
@@ -42,7 +45,9 @@ func NewMumbleConnectionManager(address string, config *gumble.Config, tlsConfig
 		config:                config,
 		tlsConfig:             tlsConfig,
 		disconnectCh:          make(chan *gumble.DisconnectEvent, 1),
+		managerConfig:         DefaultConnectionManagerConfig(),
 	}
+	manager.connectFunc = manager.connect
 
 	// Attach this connection manager as an event listener to the gumble config
 	if config != nil {
@@ -69,6 +74,7 @@ func (m *MumbleConnectionManager) Start(ctx context.Context) error {
 func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 	defer m.disconnectInternal()
 
+	retries := 0
 	for {
 		// Check if we're in a permanent failure state (kicked/banned)
 		if m.GetStatus() == ConnectionFailed {
@@ -86,17 +92,19 @@ func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 		}
 
 		// Attempt connection
-		if err := m.connect(); err != nil {
+		if err := m.connectFunc(); err != nil {
 			m.logger.Error("MUMBLE_CONN", fmt.Sprintf("Connection failed: %v", err))
-			m.SetStatus(ConnectionReconnecting, err)
-
-			// Wait before retrying
-			select {
-			case <-time.After(2 * time.Second):
-				continue
-			case <-ctx.Done():
+			if retries >= m.managerConfig.MaxRetries {
+				m.SetStatus(ConnectionFailed, err)
 				return
 			}
+			m.SetStatus(ConnectionReconnecting, err)
+			delay := retryDelay(m.managerConfig, retries)
+			retries++
+			if !waitRetry(ctx, delay) {
+				return
+			}
+			continue
 		}
 
 		// Connection successful - check if context is still active
@@ -104,6 +112,7 @@ func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		default:
+			retries = 0
 			m.SetStatus(ConnectionConnected, nil)
 			m.logger.Info("MUMBLE_CONN", "Mumble connection established")
 		}
@@ -112,7 +121,14 @@ func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case disconnectEvent := <-m.disconnectCh:
+		case disconnectEvent, ok := <-m.disconnectCh:
+			if !ok {
+				return
+			}
+			if disconnectEvent == nil {
+				m.logger.Warn("MUMBLE_CONN", "Ignoring nil disconnect event")
+				continue
+			}
 			m.handleDisconnectEvent(disconnectEvent)
 			// Check if this was a permanent failure (kicked/banned)
 			if m.GetStatus() == ConnectionFailed {
@@ -151,6 +167,10 @@ func (m *MumbleConnectionManager) connect() error {
 
 		return fmt.Errorf("failed to connect to Mumble server: %w", err)
 	}
+	if err := m.moveToTargetChannel(client); err != nil {
+		_ = client.Disconnect()
+		return err
+	}
 
 	// Store connection and create audio channel
 	m.clientMutex.Lock()
@@ -162,6 +182,59 @@ func (m *MumbleConnectionManager) connect() error {
 		address, client.State()))
 
 	return nil
+}
+
+// SetTargetChannel configures the exact channel path; an empty path explicitly means root.
+func (m *MumbleConnectionManager) SetTargetChannel(channel []string) {
+	m.configMutex.Lock()
+	m.targetChannel = append([]string(nil), channel...)
+	m.configMutex.Unlock()
+}
+
+func (m *MumbleConnectionManager) moveToTargetChannel(client *gumble.Client) error {
+	m.configMutex.RLock()
+	path := append([]string(nil), m.targetChannel...)
+	m.configMutex.RUnlock()
+
+	var target *gumble.Channel
+	client.Do(func() {
+		if len(path) == 0 {
+			target = client.Channels[0]
+		} else {
+			target = client.Channels.Find(path...)
+		}
+		if target != nil && client.Self != nil && (client.Self.Channel == nil || client.Self.Channel.ID != target.ID) {
+			client.Self.Move(target)
+		}
+	})
+	if target == nil {
+		return fmt.Errorf("configured Mumble channel not found")
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	var done <-chan struct{}
+	if m.ctx != nil {
+		done = m.ctx.Done()
+	}
+	for {
+		moved := false
+		client.Do(func() {
+			moved = client.Self != nil && client.Self.Channel != nil && client.Self.Channel.ID == target.ID
+		})
+		if moved {
+			return nil
+		}
+		select {
+		case <-done:
+			return m.ctx.Err()
+		case <-deadline.C:
+			return fmt.Errorf("Mumble channel move was not confirmed")
+		case <-ticker.C:
+		}
+	}
 }
 
 // disconnectInternal disconnects from Mumble without changing status.
@@ -185,6 +258,11 @@ func (m *MumbleConnectionManager) disconnectInternal() {
 
 // handleDisconnectEvent processes different types of disconnect events
 func (m *MumbleConnectionManager) handleDisconnectEvent(event *gumble.DisconnectEvent) {
+	if event == nil {
+		m.logger.Warn("MUMBLE_CONN", "Ignoring nil disconnect event")
+		return
+	}
+
 	switch event.Type {
 	case gumble.DisconnectError:
 		m.SetStatus(ConnectionReconnecting, fmt.Errorf("connection error: %s", event.String))

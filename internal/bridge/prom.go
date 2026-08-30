@@ -120,6 +120,11 @@ var (
 		Help: "The number of packets sent to Discord",
 	})
 
+	promDiscordOutboundHealth = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "mdb_discord_outbound_health",
+		Help: "Current Discord outbound health (0=unproven, 1=healthy, 2=unhealthy, 3=inactive)",
+	})
+
 	promDiscordArraySize = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "mdb_discord_array_size_gauge",
 		Help: "The discord receiving array size",
@@ -209,7 +214,7 @@ func StartPromServer(port int, b *BridgeState) {
 	})
 	http.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
 		b.BridgeMutex.Lock()
-		connected := b.Connected
+		connected := b.readyLocked()
 		b.BridgeMutex.Unlock()
 
 		if connected {
