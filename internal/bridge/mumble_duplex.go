@@ -98,6 +98,7 @@ func (m *MumbleDuplex) OnAudioStream(e *gumble.AudioStreamEvent) {
 
 	m.mutex.Lock()
 	m.streams = append(m.streams, stream)
+	streamCount := len(m.streams)
 	// Add cleanup callback for this stream using map for O(1) access
 	done := make(chan struct{})
 	m.streamCleanupCallbacks[stream] = func() {
@@ -116,7 +117,7 @@ func (m *MumbleDuplex) OnAudioStream(e *gumble.AudioStreamEvent) {
 	}
 	m.mutex.Unlock()
 
-	promMumbleArraySize.Set(float64(len(m.streams)))
+	promMumbleArraySize.Set(float64(streamCount))
 
 	go func() {
 		name := e.User.Name
@@ -253,86 +254,31 @@ func (m *MumbleDuplex) MixOneChunk() (mixed []int16, streamingCount int) {
 	return mixPCM(sources...), streamingCount
 }
 
-// toMumbleSender sends audio packets from Discord to Mumble's audio channel.
-// Detects Mumble reconnections by comparing the cached audio channel pointer against
-// MumbleConnectionManager.GetAudioOutgoing(). The pointer changes when a new gumble
-// client is created, so even if Mumble reconnects while this goroutine is blocked
-// waiting for Discord packets, the stale channel is detected on the next packet.
+// toMumbleSender sends audio through the manager-owned final handoff.
 func (m *MumbleDuplex) toMumbleSender(ctx context.Context, internalChan <-chan gumble.AudioBuffer) {
 	const sendTimeout = 20 * time.Millisecond
-
-	var mumbleOutgoing chan<- gumble.AudioBuffer
-
-	sendTimer := time.NewTimer(sendTimeout)
-	sendTimer.Stop()
-
-	// closeOldChannel safely closes a stale gumble AudioOutgoing channel,
-	// allowing gumble's goroutine to exit cleanly.
-	closeOldChannel := func(ch chan<- gumble.AudioBuffer) {
-		if ch == nil {
-			return
-		}
-		defer func() {
-			if r := recover(); r != nil {
-				m.logger.Warn("MUMBLE_FORWARDER", fmt.Sprintf("Panic closing old audio channel: %v", r))
-			}
-		}()
-		close(ch)
-	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			sendTimer.Stop()
-			// Do NOT close mumbleOutgoing here — it belongs to the persistent
-			// Mumble connection and will be reused by future audio pipelines.
 			return
 
 		case packet, ok := <-internalChan:
 			if !ok {
-				sendTimer.Stop()
 				m.logger.Info("MUMBLE_FORWARDER", "Internal audio channel closed, stopping toMumbleSender")
 
 				return
 			}
 			promMumbleBufferedPackets.Set(float64(len(internalChan)))
 
-			// Get current audio channel from connection manager.
-			// The pointer is cached per-client, so a different pointer means reconnection.
-			var currentOutgoing chan<- gumble.AudioBuffer
-			if m.bridge.MumbleConnectionManager != nil {
-				currentOutgoing = m.bridge.MumbleConnectionManager.GetAudioOutgoing()
-			}
-
-			// Detect channel change: reconnection, disconnect, or first connect
-			if currentOutgoing != mumbleOutgoing {
-				switch {
-				case mumbleOutgoing != nil && currentOutgoing != nil:
-					closeOldChannel(mumbleOutgoing)
-					m.logger.Info("MUMBLE_FORWARDER", "Mumble reconnected, refreshed audio channel")
-				case currentOutgoing == nil:
-					closeOldChannel(mumbleOutgoing)
-					m.logger.Info("MUMBLE_FORWARDER", "Mumble disconnected")
-				default:
-					m.logger.Info("MUMBLE_FORWARDER", "Mumble connected, got audio channel")
-				}
-				mumbleOutgoing = currentOutgoing
-			}
-
-			if mumbleOutgoing == nil {
+			manager := m.bridge.MumbleConnectionManager
+			if manager == nil {
 				promPacketsSunk.WithLabelValues("mumble", "inbound").Inc()
-
 				continue
 			}
-
-			sendTimer.Reset(sendTimeout)
-			select {
-			case mumbleOutgoing <- packet:
-				if !sendTimer.Stop() {
-					<-sendTimer.C
-				}
+			if manager.SendAudio(ctx, packet, sendTimeout) {
 				promSentMumblePackets.Inc()
-			case <-sendTimer.C:
+			} else if ctx.Err() == nil {
 				promMumbleSendTimeouts.Inc()
 				promToMumbleDropped.Inc()
 			}

@@ -25,6 +25,9 @@ type DisgoVoiceConnection struct {
 	mu      sync.RWMutex
 	ready   bool
 	closed  bool
+
+	// Private production seams keep failed-Open cleanup deterministic in tests.
+	createConn func() voice.Conn
 }
 
 // Open connects to the specified voice channel.
@@ -37,17 +40,26 @@ func (vc *DisgoVoiceConnection) Open(ctx context.Context, channelID string) erro
 		return fmt.Errorf("invalid channel ID %s: %w", channelID, err)
 	}
 
-	conn := vc.client.VoiceManager.CreateConn(vc.guildID)
+	createConn := vc.createConn
+	if createConn == nil {
+		createConn = func() voice.Conn { return vc.client.VoiceManager.CreateConn(vc.guildID) }
+	}
+	conn := createConn()
 
 	// Perform the blocking open without holding the lock.
 	if err := conn.Open(ctx, cid, false, false); err != nil {
+		conn.Close(ctx)
 		return fmt.Errorf("failed to open voice connection: %w", err)
 	}
 
 	// Publish the ready connection atomically.
 	vc.mu.Lock()
+	if vc.closed {
+		vc.mu.Unlock()
+		conn.Close(ctx)
+		return errors.New("voice connection closed during open")
+	}
 	vc.conn = conn
-	vc.closed = false
 	vc.ready = true
 	vc.mu.Unlock()
 
@@ -57,16 +69,20 @@ func (vc *DisgoVoiceConnection) Open(ctx context.Context, channelID string) erro
 // Close disconnects from the voice channel.
 func (vc *DisgoVoiceConnection) Close(ctx context.Context) error {
 	vc.mu.Lock()
-	defer vc.mu.Unlock()
-
-	if vc.conn == nil || vc.closed {
+	if vc.closed {
+		vc.mu.Unlock()
 		return nil
 	}
 
 	vc.closed = true
 	vc.ready = false
-	vc.conn.Close(ctx)
-	vc.client.VoiceManager.RemoveConn(vc.guildID)
+	conn := vc.conn
+	vc.conn = nil
+	vc.mu.Unlock()
+
+	if conn != nil {
+		conn.Close(ctx)
+	}
 
 	return nil
 }

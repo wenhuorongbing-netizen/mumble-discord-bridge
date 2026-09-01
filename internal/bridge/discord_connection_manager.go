@@ -25,6 +25,7 @@ type DiscordVoiceConnectionManager struct {
 	config      *ConnectionManagerConfig
 	connectFunc func() error
 	monitorFunc func(context.Context)
+	loopWg      sync.WaitGroup
 }
 
 // NewDiscordVoiceConnectionManager creates a new Discord connection manager
@@ -48,7 +49,11 @@ func (d *DiscordVoiceConnectionManager) Start(ctx context.Context) error {
 	d.logger.Info("DISCORD_CONN", "Starting Discord connection manager (disgo+godave with DAVE E2EE)")
 
 	d.InitContext(ctx)
-	go d.mainConnectionLoop(d.ctx)
+	d.loopWg.Add(1)
+	go func() {
+		defer d.loopWg.Done()
+		d.mainConnectionLoop(d.ctx)
+	}()
 
 	return nil
 }
@@ -179,6 +184,12 @@ func (d *DiscordVoiceConnectionManager) connectOnce() error {
 
 	if err := voiceConn.Open(openCtx, channelID); err != nil {
 		d.logger.Error("DISCORD_CONN", fmt.Sprintf("Voice connection failed: %v", err))
+		// The abstraction owns any object it creates even when Open fails.
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if closeErr := voiceConn.Close(closeCtx); closeErr != nil {
+			d.logger.Error("DISCORD_CONN", fmt.Sprintf("Error closing failed voice connection: %v", closeErr))
+		}
+		closeCancel()
 		return fmt.Errorf("failed to join voice channel: %w", err)
 	}
 
@@ -266,6 +277,7 @@ func (d *DiscordVoiceConnectionManager) Stop() error {
 	if err := d.BaseConnectionManager.Stop(); err != nil {
 		d.logger.Error("DISCORD_CONN", fmt.Sprintf("Error stopping base connection manager: %v", err))
 	}
+	d.loopWg.Wait()
 
 	d.disconnectInternal()
 

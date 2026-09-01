@@ -3,9 +3,11 @@ package bridgelib
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	internalbridge "github.com/stieneee/mumble-discord-bridge/internal/bridge"
 	"github.com/stieneee/mumble-discord-bridge/internal/discord"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,6 +17,19 @@ import (
 type mockBridgeLibClient struct {
 	mu    sync.Mutex
 	ready bool
+}
+
+type stopSignalTestLogger struct {
+	*MockTestLogger
+	once     sync.Once
+	signaled chan struct{}
+}
+
+func (l *stopSignalTestLogger) Debug(component, message string) {
+	l.MockTestLogger.Debug(component, message)
+	if message == "Auto/mumble bridge stop signal sent" {
+		l.once.Do(func() { close(l.signaled) })
+	}
 }
 
 func (m *mockBridgeLibClient) Connect(_ context.Context) error { return nil }
@@ -175,4 +190,114 @@ func TestSharedDiscordClient_SessionMonitorLoop_LogsUnhealthy(t *testing.T) {
 	}
 	assert.True(t, foundStarted, "expected 'Session monitoring loop started' log entry, got: %v", entries)
 	assert.True(t, foundExiting, "expected 'Session monitoring loop exiting' log entry, got: %v", entries)
+}
+
+func TestBridgeInstance_StopJoinsModeBeforeStoppedPublicationAndHandlerRemoval(t *testing.T) {
+	lgr := &MockTestLogger{}
+	ctx, cancel := context.WithCancel(context.Background())
+	dispatcher := NewEventDispatcher("offline", 4, lgr)
+	dispatcher.Start()
+	var modeDone atomic.Bool
+	var handlerRemoved atomic.Bool
+	stoppedObserved := make(chan bool, 1)
+	dispatcher.RegisterHandler(EventBridgeStopped, func(BridgeEvent) {
+		stoppedObserved <- modeDone.Load() && handlerRemoved.Load()
+	})
+	instance := &BridgeInstance{
+		State: &internalbridge.BridgeState{
+			Mode:   internalbridge.BridgeModeConstant,
+			Logger: lgr,
+		},
+		config:          &BridgeConfig{},
+		logger:          lgr,
+		eventDispatcher: dispatcher,
+		ctx:             ctx,
+		cancel:          cancel,
+		removeEventHandler: func() {
+			require.True(t, modeDone.Load(), "handler removal must follow mode cleanup")
+			handlerRemoved.Store(true)
+		},
+	}
+	instance.modeWg.Add(1)
+	go func() {
+		defer instance.modeWg.Done()
+		<-ctx.Done()
+		modeDone.Store(true)
+	}()
+
+	require.NoError(t, instance.Stop())
+	require.True(t, instance.stopped)
+	require.True(t, modeDone.Load())
+	require.True(t, handlerRemoved.Load())
+	select {
+	case ordered := <-stoppedObserved:
+		require.True(t, ordered, "stopped publication must follow cleanup and handler removal")
+	case <-time.After(time.Second):
+		t.Fatal("stopped event was not dispatched")
+	}
+}
+
+func TestBridgeInstance_StopModeSignalIsRetainedAndIdempotent(t *testing.T) {
+	for _, mode := range []internalbridge.BridgeMode{internalbridge.BridgeModeAuto, internalbridge.BridgeModeMumble} {
+		t.Run(mode.String(), func(t *testing.T) {
+			lgr := &stopSignalTestLogger{MockTestLogger: &MockTestLogger{}, signaled: make(chan struct{})}
+			ctx, cancel := context.WithCancel(context.Background())
+			modeStop := make(chan bool)
+			instance := &BridgeInstance{
+				State: &internalbridge.BridgeState{
+					Mode:        mode,
+					AutoChanDie: modeStop,
+					Logger:      lgr,
+				},
+				config: &BridgeConfig{},
+				logger: lgr,
+				ctx:    ctx,
+				cancel: cancel,
+			}
+
+			proceed := make(chan struct{})
+			cleanup := make(chan struct{})
+			observed := make(chan bool, 1)
+			instance.modeWg.Add(1)
+			go func() {
+				defer instance.modeWg.Done()
+				<-proceed // Deliberately busy while Stop signals.
+				select {
+				case _, ok := <-modeStop:
+					observed <- !ok
+				case <-cleanup:
+				}
+			}()
+
+			firstDone := make(chan error, 1)
+			go func() { firstDone <- instance.Stop() }()
+			<-lgr.signaled // Stop has executed the production signal branch.
+
+			retained := false
+			select {
+			case _, ok := <-modeStop:
+				retained = !ok
+			default:
+			}
+			if !retained {
+				close(cleanup)
+				close(proceed)
+				<-firstDone
+				t.Fatal("mode stop signal was lost while worker was busy")
+			}
+
+			const concurrentStops = 10
+			concurrentDone := make(chan error, concurrentStops)
+			for range concurrentStops {
+				go func() { concurrentDone <- instance.Stop() }()
+			}
+			close(proceed)
+			require.True(t, <-observed, "worker must observe close after becoming receptive")
+			require.NoError(t, <-firstDone)
+			for range concurrentStops {
+				require.NoError(t, <-concurrentDone)
+			}
+			require.NoError(t, instance.Stop(), "repeated Stop must not close the channel twice")
+		})
+	}
 }

@@ -15,24 +15,30 @@ import (
 // MumbleConnectionManager manages Mumble connections with automatic reconnection
 type MumbleConnectionManager struct {
 	*BaseConnectionManager
-	client             *gumble.Client
-	config             *gumble.Config
-	address            string
-	tlsConfig          *tls.Config
-	clientMutex        sync.RWMutex
-	configMutex        sync.RWMutex                 // Protects address, config, tlsConfig, and targetChannel
-	disconnectCh       chan *gumble.DisconnectEvent // Channel to signal disconnection events
-	disconnectMux      sync.Mutex                   // Protects disconnectCh and disconnectChClosed
-	disconnectChClosed bool                         // Flag to track if disconnectCh is closed
+	client        *gumble.Client
+	config        *gumble.Config
+	address       string
+	tlsConfig     *tls.Config
+	clientMutex   sync.RWMutex
+	audioMutex    sync.Mutex                   // Serializes AudioOutgoing sends and its sole close owner.
+	configMutex   sync.RWMutex                 // Protects address, config, tlsConfig, and targetChannel
+	disconnectCh  chan *gumble.DisconnectEvent // Channel to signal disconnection events
+	disconnectMux sync.Mutex                   // Serializes disconnect event publication
 
-	// Cached audio channel — created once per client in connect(), set to nil in disconnectInternal().
-	// gumble.AudioOutgoing() spawns a goroutine per channel, so we must not call it more than once
-	// per client. The caller (toMumbleSender) detects reconnections by comparing channel pointers
-	// and closes the stale channel to clean up gumble's goroutine.
-	audioOutgoing chan<- gumble.AudioBuffer // Protected by clientMutex
-	managerConfig *ConnectionManagerConfig
-	connectFunc   func() error
-	targetChannel []string
+	// Cached audio channel — created and closed exactly once by this manager per client.
+	audioOutgoing  chan<- gumble.AudioBuffer // Protected by audioMutex
+	managerConfig  *ConnectionManagerConfig
+	connectFunc    func(context.Context, uint64) error
+	targetChannel  []string
+	connectTimeout time.Duration
+	dialFunc       func(*net.Dialer, string, *gumble.Config, *tls.Config) (*gumble.Client, error)
+
+	runMutex   sync.Mutex // Lock order: runMutex -> clientMutex -> audioMutex.
+	generation uint64
+	running    bool
+	loopWg     sync.WaitGroup
+	stopSignal sync.Once
+	stopCh     chan struct{}
 }
 
 // NewMumbleConnectionManager creates a new Mumble connection manager
@@ -46,6 +52,9 @@ func NewMumbleConnectionManager(address string, config *gumble.Config, tlsConfig
 		tlsConfig:             tlsConfig,
 		disconnectCh:          make(chan *gumble.DisconnectEvent, 1),
 		managerConfig:         DefaultConnectionManagerConfig(),
+		connectTimeout:        30 * time.Second,
+		dialFunc:              gumble.DialWithDialer,
+		stopCh:                make(chan struct{}),
 	}
 	manager.connectFunc = manager.connect
 
@@ -63,9 +72,17 @@ func (m *MumbleConnectionManager) Start(ctx context.Context) error {
 
 	// Initialize context for proper cancellation chain
 	m.InitContext(ctx)
+	m.runMutex.Lock()
+	m.generation++
+	m.running = true
+	m.runMutex.Unlock()
 
 	// Start connection management goroutine
-	go m.connectionLoop(m.ctx)
+	m.loopWg.Add(1)
+	go func() {
+		defer m.loopWg.Done()
+		m.connectionLoop(m.ctx)
+	}()
 
 	return nil
 }
@@ -73,6 +90,20 @@ func (m *MumbleConnectionManager) Start(ctx context.Context) error {
 // connectionLoop manages the connection lifecycle with reconnection logic
 func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 	defer m.disconnectInternal()
+	m.runMutex.Lock()
+	if !m.running {
+		m.generation++
+		m.running = true
+	}
+	generation := m.generation
+	m.runMutex.Unlock()
+	defer func() {
+		m.runMutex.Lock()
+		if m.generation == generation {
+			m.running = false
+		}
+		m.runMutex.Unlock()
+	}()
 
 	retries := 0
 	for {
@@ -88,11 +119,13 @@ func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 			m.logger.Info("MUMBLE_CONN", "Connection loop canceled")
 
 			return
+		case <-m.stopCh:
+			return
 		default:
 		}
 
 		// Attempt connection
-		if err := m.connectFunc(); err != nil {
+		if err := m.connectFunc(ctx, generation); err != nil {
 			m.logger.Error("MUMBLE_CONN", fmt.Sprintf("Connection failed: %v", err))
 			if retries >= m.managerConfig.MaxRetries {
 				m.SetStatus(ConnectionFailed, err)
@@ -108,18 +141,21 @@ func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 		}
 
 		// Connection successful - check if context is still active
-		select {
-		case <-ctx.Done():
+		m.runMutex.Lock()
+		if !m.running || m.generation != generation || ctx.Err() != nil {
+			m.runMutex.Unlock()
 			return
-		default:
-			retries = 0
-			m.SetStatus(ConnectionConnected, nil)
-			m.logger.Info("MUMBLE_CONN", "Mumble connection established")
 		}
+		retries = 0
+		m.SetStatus(ConnectionConnected, nil)
+		m.runMutex.Unlock()
+		m.logger.Info("MUMBLE_CONN", "Mumble connection established")
 
 		// Wait for disconnect event
 		select {
 		case <-ctx.Done():
+			return
+		case <-m.stopCh:
 			return
 		case disconnectEvent, ok := <-m.disconnectCh:
 			if !ok {
@@ -141,7 +177,7 @@ func (m *MumbleConnectionManager) connectionLoop(ctx context.Context) {
 }
 
 // connect establishes a Mumble connection
-func (m *MumbleConnectionManager) connect() error {
+func (m *MumbleConnectionManager) connect(ctx context.Context, generation uint64) error {
 	m.SetStatus(ConnectionConnecting, nil)
 
 	// Read configuration under lock
@@ -161,7 +197,8 @@ func (m *MumbleConnectionManager) connect() error {
 	m.disconnectInternal()
 
 	// Attempt Mumble connection
-	client, err := gumble.DialWithDialer(new(net.Dialer), address, config, tlsConfig)
+	dialer := &net.Dialer{Timeout: m.connectTimeout}
+	client, err := m.dialFunc(dialer, address, config, tlsConfig)
 	if err != nil {
 		m.logger.Error("MUMBLE_CONN", fmt.Sprintf("Failed to dial Mumble server %s: %v", address, err))
 
@@ -172,11 +209,21 @@ func (m *MumbleConnectionManager) connect() error {
 		return err
 	}
 
-	// Store connection and create audio channel
+	// Publish only into the still-active manager generation. Stop takes runMutex
+	// before cancellation, so a late successful dial cannot resurrect a client.
+	m.runMutex.Lock()
+	if !m.running || m.generation != generation || ctx.Err() != nil {
+		m.runMutex.Unlock()
+		_ = client.Disconnect()
+		return context.Canceled
+	}
 	m.clientMutex.Lock()
 	m.client = client
-	m.audioOutgoing = client.AudioOutgoing()
 	m.clientMutex.Unlock()
+	m.audioMutex.Lock()
+	m.audioOutgoing = client.AudioOutgoing()
+	m.audioMutex.Unlock()
+	m.runMutex.Unlock()
 
 	m.logger.Debug("MUMBLE_CONN", fmt.Sprintf("Mumble connection established successfully to %s, client state: %d",
 		address, client.State()))
@@ -237,22 +284,26 @@ func (m *MumbleConnectionManager) moveToTargetChannel(client *gumble.Client) err
 	}
 }
 
-// disconnectInternal disconnects from Mumble without changing status.
-// Sets audioOutgoing to nil but does NOT close the channel — the caller
-// (toMumbleSender) closes it when it detects the pointer change, avoiding
-// a send-on-closed-channel race.
+// disconnectInternal retires the current client and its manager-owned audio
+// channel. audioMutex prevents a close from racing with SendAudio.
 func (m *MumbleConnectionManager) disconnectInternal() {
 	m.clientMutex.Lock()
-	defer m.clientMutex.Unlock()
+	client := m.client
+	m.client = nil
+	m.clientMutex.Unlock()
 
-	m.audioOutgoing = nil
+	m.audioMutex.Lock()
+	if m.audioOutgoing != nil {
+		close(m.audioOutgoing)
+		m.audioOutgoing = nil
+	}
+	m.audioMutex.Unlock()
 
-	if m.client != nil {
+	if client != nil {
 		m.logger.Debug("MUMBLE_CONN", "Disconnecting from Mumble")
-		if err := m.client.Disconnect(); err != nil {
+		if err := client.Disconnect(); err != nil {
 			m.logger.Error("MUMBLE_CONN", fmt.Sprintf("Error disconnecting from Mumble: %v", err))
 		}
-		m.client = nil
 	}
 }
 
@@ -286,21 +337,19 @@ func (m *MumbleConnectionManager) handleDisconnectEvent(event *gumble.Disconnect
 func (m *MumbleConnectionManager) Stop() error {
 	m.logger.Info("MUMBLE_CONN", "Stopping Mumble connection manager")
 
+	m.runMutex.Lock()
+	m.running = false
+	m.runMutex.Unlock()
+	m.stopSignal.Do(func() { close(m.stopCh) })
+
 	// Stop the base connection manager (cancels context)
 	if err := m.BaseConnectionManager.Stop(); err != nil {
 		m.logger.Error("MUMBLE_CONN", fmt.Sprintf("Error stopping base connection manager: %v", err))
 	}
+	m.loopWg.Wait()
 
 	// Disconnect from Mumble
 	m.disconnectInternal()
-
-	// Close the disconnect channel to prevent any further events
-	m.disconnectMux.Lock()
-	if !m.disconnectChClosed {
-		m.disconnectChClosed = true
-		close(m.disconnectCh)
-	}
-	m.disconnectMux.Unlock()
 
 	return nil
 }
@@ -324,16 +373,23 @@ func (m *MumbleConnectionManager) OnConnect(_ *gumble.ConnectEvent) {
 
 // OnDisconnect handles gumble disconnection events and signals the connection loop
 func (m *MumbleConnectionManager) OnDisconnect(e *gumble.DisconnectEvent) {
+	if e == nil {
+		return
+	}
 	m.logger.Warn("MUMBLE_CONN", fmt.Sprintf("Disconnect event received: %s", e.String))
 
 	// Signal the connection loop about the disconnection
 	m.disconnectMux.Lock()
 	defer m.disconnectMux.Unlock()
 
-	// Check if channel is closed before attempting to send
-	if m.disconnectChClosed {
-		m.logger.Debug("MUMBLE_CONN", "Disconnect channel already closed, skipping event")
-
+	m.runMutex.Lock()
+	running := m.running
+	m.runMutex.Unlock()
+	m.clientMutex.RLock()
+	current := m.client
+	m.clientMutex.RUnlock()
+	if !running || (e.Client != nil && e.Client != current) {
+		m.logger.Debug("MUMBLE_CONN", "Ignoring stale or stopped-generation disconnect event")
 		return
 	}
 
@@ -375,14 +431,24 @@ func (m *MumbleConnectionManager) OnContextActionChange(_ *gumble.ContextActionC
 // OnServerConfig implements gumble.EventListener interface (unused)
 func (m *MumbleConnectionManager) OnServerConfig(_ *gumble.ServerConfigEvent) {}
 
-// GetAudioOutgoing returns the cached audio outgoing channel for the current client.
-// Returns nil when disconnected. The channel pointer changes on each reconnection,
-// so callers can detect reconnections by comparing pointers.
-func (m *MumbleConnectionManager) GetAudioOutgoing() chan<- gumble.AudioBuffer {
-	m.clientMutex.RLock()
-	defer m.clientMutex.RUnlock()
-
-	return m.audioOutgoing
+// SendAudio synchronizes the final handoff with client retirement. The manager
+// remains the sole owner allowed to close AudioOutgoing.
+func (m *MumbleConnectionManager) SendAudio(ctx context.Context, packet gumble.AudioBuffer, timeout time.Duration) bool {
+	m.audioMutex.Lock()
+	defer m.audioMutex.Unlock()
+	if m.audioOutgoing == nil {
+		return false
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case m.audioOutgoing <- packet:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 // GetSelfName safely returns the client's own name

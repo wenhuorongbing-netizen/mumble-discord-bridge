@@ -2,12 +2,16 @@ package bridge
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestBridge_DiscordUsersMapRace tests concurrent map access under mutex
@@ -546,4 +550,191 @@ func TestBridgeState_StopDiscordVoice(t *testing.T) {
 
 	// Verify the monitoring goroutine exited
 	assert.True(t, monitorExited.Load(), "monitoring goroutine should have exited")
+}
+
+func TestBridge_StartBridgeFailureClearsActiveAndReadiness(t *testing.T) {
+	for _, stage := range []string{"initialize", "start"} {
+		t.Run(stage, func(t *testing.T) {
+			state := createTestBridgeState(nil)
+			if stage == "initialize" {
+				state.initializeManagers = func() error { return errors.New("offline initialization failure") }
+			} else {
+				state.initializeManagers = func() error { return nil }
+				state.startManagers = func() error { return errors.New("offline start failure") }
+				state.stopManagers = func() {}
+			}
+			state.StartBridge()
+
+			state.BridgeMutex.Lock()
+			defer state.BridgeMutex.Unlock()
+			require.False(t, state.BridgeActive)
+			require.False(t, state.Connected)
+			require.False(t, state.DiscordConnected)
+			require.False(t, state.MumbleConnected)
+			require.Nil(t, state.bridgeCancel)
+			require.Nil(t, state.bridgeDone)
+			require.True(t, state.StartTime.IsZero())
+		})
+	}
+}
+
+func TestBridge_StopBeforePublicationConsumesOnlyRegisteredIntent(t *testing.T) {
+	state := createTestBridgeState(nil)
+	var initializeCalls atomic.Int32
+	state.initializeManagers = func() error {
+		initializeCalls.Add(1)
+		return errors.New("offline initialization failure")
+	}
+
+	state.RegisterBridgeStartIntent()
+	state.StopBridge()
+	state.BridgeMutex.Lock()
+	require.True(t, state.stopPending)
+	require.Equal(t, 1, state.startIntents)
+	state.BridgeMutex.Unlock()
+
+	state.StartBridgeFromIntent()
+	require.Zero(t, initializeCalls.Load(), "pending stop must consume the registered start before publication")
+	state.BridgeMutex.Lock()
+	require.False(t, state.stopPending)
+	require.Zero(t, state.startIntents)
+	state.BridgeMutex.Unlock()
+
+	state.StartBridge()
+	require.Equal(t, int32(1), initializeCalls.Load(), "consumed stop must not poison a later legitimate start")
+	state.StopBridge() // idle stop with no intent must also remain non-poisoning
+	state.StartBridge()
+	require.Equal(t, int32(2), initializeCalls.Load())
+}
+
+func TestBridge_CanceledStartIntentClearsPendingStop(t *testing.T) {
+	state := createTestBridgeState(nil)
+	state.RegisterBridgeStartIntent()
+	state.StopBridge()
+	state.CancelBridgeStartIntent()
+
+	state.BridgeMutex.Lock()
+	require.False(t, state.stopPending)
+	require.Zero(t, state.startIntents)
+	state.BridgeMutex.Unlock()
+}
+
+func TestBridge_StopPublicationInterleavingsJoinFullCleanup(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		state := createTestBridgeState(nil)
+		state.BridgeConfig.MumbleConfig = nil
+		enteredStart := make(chan struct{})
+		releaseStart := make(chan struct{})
+		state.initializeManagers = func() error { return nil }
+		state.stopManagers = func() {}
+		state.startManagers = func() error {
+			close(enteredStart)
+			<-releaseStart
+			return nil
+		}
+		state.RegisterBridgeStartIntent()
+		go state.StartBridgeFromIntent()
+		<-enteredStart
+		state.BridgeMutex.Lock()
+		sessionCtx := state.bridgeCtx
+		state.BridgeMutex.Unlock()
+		require.NotNil(t, sessionCtx)
+		stopDone := make(chan struct{})
+		go func() {
+			state.StopBridge()
+			close(stopDone)
+		}()
+		<-sessionCtx.Done()
+		close(releaseStart)
+
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: StopBridge did not join full session cleanup", iteration)
+		}
+		require.True(t, state.lock.TryLock(), "iteration %d: session lock finalizer was not complete", iteration)
+		state.lock.Unlock()
+		state.BridgeMutex.Lock()
+		require.False(t, state.BridgeActive)
+		require.False(t, state.Connected)
+		require.Nil(t, state.bridgeDone)
+		state.BridgeMutex.Unlock()
+		require.NotNil(t, state.WaitExit)
+		state.WaitExit.Wait()
+		require.NotNil(t, state.DiscordStream)
+		require.Nil(t, state.DiscordStream.cleanupCancel)
+		require.NotNil(t, state.MumbleStream)
+		state.MumbleStream.mutex.Lock()
+		require.Empty(t, state.MumbleStream.streams)
+		state.MumbleStream.mutex.Unlock()
+	}
+}
+
+func TestBridge_DiscordDirectMessageCountSnapshotIsSynchronized(t *testing.T) {
+	state := createTestBridgeState(nil)
+	state.BridgeConfig.DiscordTextMode = "user"
+	state.DiscordClient = &mockDiscordClient{}
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for worker := 0; worker < 20; worker++ {
+		wg.Add(2)
+		go func(id int) {
+			defer wg.Done()
+			<-start
+			for iteration := 0; iteration < 100; iteration++ {
+				key := fmt.Sprintf("user-%d-%d", id, iteration)
+				state.DiscordUsersMutex.Lock()
+				state.DiscordUsers[key] = DiscordUser{username: key, dmID: "dm-" + key}
+				delete(state.DiscordUsers, fmt.Sprintf("user-%d-%d", id, iteration-1))
+				state.DiscordUsersMutex.Unlock()
+			}
+		}(worker)
+		go func() {
+			defer wg.Done()
+			<-start
+			for iteration := 0; iteration < 100; iteration++ {
+				state.discordSendMessage("offline")
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+}
+
+func TestBridge_TeardownFailsReadinessAndResetsSessionGauges(t *testing.T) {
+	state := createTestBridgeState(nil)
+	state.BridgeMutex.Lock()
+	state.Connected = true
+	state.DiscordConnected = true
+	state.MumbleConnected = true
+	state.DiscordOutboundHealth = discordOutboundHealthy
+	state.StartTime = time.Now()
+	state.BridgeMutex.Unlock()
+	promDiscordConnectionStatus.Set(float64(ConnectionConnected))
+	promMumbleConnectionStatus.Set(float64(ConnectionConnected))
+	promDiscordConnectionUptime.Set(12)
+	promMumbleConnectionUptime.Set(12)
+	promMumbleBufferedPackets.Set(3)
+	promMumbleArraySize.Set(3)
+	promMumbleStreaming.Set(2)
+	promMumbleMaxStreamDepth.Set(4)
+	promDiscordArraySize.Set(3)
+	promDiscordStreaming.Set(2)
+	promToDiscordJitterBuffer.Set(2)
+	promRtpTimestampDrift.Set(1)
+
+	state.failReadinessAndResetMetrics()
+	require.False(t, state.IsConnected())
+	require.Zero(t, testutil.ToFloat64(promDiscordConnectionStatus))
+	require.Zero(t, testutil.ToFloat64(promMumbleConnectionStatus))
+	require.Zero(t, testutil.ToFloat64(promDiscordConnectionUptime))
+	require.Zero(t, testutil.ToFloat64(promMumbleConnectionUptime))
+	require.Zero(t, testutil.ToFloat64(promMumbleBufferedPackets))
+	require.Zero(t, testutil.ToFloat64(promMumbleArraySize))
+	require.Zero(t, testutil.ToFloat64(promMumbleStreaming))
+	require.Zero(t, testutil.ToFloat64(promMumbleMaxStreamDepth))
+	require.Zero(t, testutil.ToFloat64(promDiscordArraySize))
+	require.Zero(t, testutil.ToFloat64(promDiscordStreaming))
+	require.Zero(t, testutil.ToFloat64(promToDiscordJitterBuffer))
+	require.Zero(t, testutil.ToFloat64(promRtpTimestampDrift))
 }

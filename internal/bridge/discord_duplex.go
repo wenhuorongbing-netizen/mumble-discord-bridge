@@ -37,6 +37,10 @@ func sequenceGap(current, last uint16) int {
 	return gap - 1 // gap of 1 means 0 lost packets
 }
 
+func mumbleTrailingSilence() gumble.AudioBuffer {
+	return make(gumble.AudioBuffer, pcmChunkSize)
+}
+
 type fromDiscord struct {
 	decoder       *gopus.Decoder
 	pcm           chan []int16
@@ -559,10 +563,7 @@ func (dd *DiscordDuplex) processReceivedPacket(p *discord.AudioPacket) {
 }
 
 func (dd *DiscordDuplex) fromDiscordMixer(ctx context.Context, toMumble chan<- gumble.AudioBuffer) {
-	mumbleSilence := make(gumble.AudioBuffer, 0, pcmChunkSize-3)
-	for i := 3; i < pcmChunkSize; i++ {
-		mumbleSilence = append(mumbleSilence, 0x00)
-	}
+	mumbleSilence := mumbleTrailingSilence()
 	var speakingStart time.Time
 
 	dd.discordReceiveSleepTick.Start(10 * time.Millisecond)
@@ -623,7 +624,6 @@ func (dd *DiscordDuplex) fromDiscordMixer(ctx context.Context, toMumble chan<- g
 		mumbleTimeoutSend := func(outBuf []int16) {
 			select {
 			case toMumble <- outBuf:
-				promSentMumblePackets.Inc()
 			case <-time.After(10 * time.Millisecond):
 				dd.Bridge.Logger.Debug("DISCORD_MIXER", "To Mumble timeout. Dropping packet")
 				promToMumbleDropped.Inc()

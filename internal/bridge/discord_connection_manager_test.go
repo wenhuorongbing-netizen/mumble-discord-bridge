@@ -128,6 +128,7 @@ type mockVoiceConn struct {
 	gatewayReady  bool
 	opened        bool
 	closed        bool
+	closeCalls    int
 	mu            sync.Mutex
 	openErr       error
 	openedChannel string
@@ -151,6 +152,7 @@ func (m *mockVoiceConn) Close(_ context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
+	m.closeCalls++
 	return nil
 }
 
@@ -301,6 +303,21 @@ func TestDiscord_ConnectUsesSingleChannelSnapshotDuringConcurrentUpdate(t *testi
 		t.Fatal("connectOnce did not finish")
 	}
 	require.Equal(t, "test-channel", voiceConn.getOpenedChannel(), "log and Open must use one locked channel snapshot")
+	require.NoError(t, mgr.Stop())
+}
+
+func TestDiscord_FailedOpenClosesCreatedAbstraction(t *testing.T) {
+	voiceConn := &mockVoiceConn{openErr: errors.New("offline open failure")}
+	client := &mockDiscordClientForConn{ready: true, voiceConn: voiceConn}
+	mgr, _, _ := newTestDiscordManager(client)
+	mgr.InitContext(context.Background())
+
+	require.ErrorContains(t, mgr.connectOnce(), "failed to join voice channel")
+	voiceConn.mu.Lock()
+	closeCalls := voiceConn.closeCalls
+	voiceConn.mu.Unlock()
+	require.Equal(t, 1, closeCalls, "manager must defensively close a failed abstraction")
+	require.Nil(t, mgr.GetVoiceConnection())
 	require.NoError(t, mgr.Stop())
 }
 

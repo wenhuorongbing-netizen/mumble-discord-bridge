@@ -2,12 +2,15 @@ package bridge
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stieneee/gumble/gumble"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,7 +20,7 @@ func TestMumble_RetryBudgetEndsInFailed(t *testing.T) {
 	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), NewMockBridgeEventEmitter())
 	manager.managerConfig = &ConnectionManagerConfig{MaxRetries: 2, BaseRetryDelay: time.Millisecond, MaxRetryDelay: 2 * time.Millisecond, RetryMultiplier: 2}
 	attempts := 0
-	manager.connectFunc = func() error {
+	manager.connectFunc = func(context.Context, uint64) error {
 		attempts++
 		return errors.New("connect failed")
 	}
@@ -40,7 +43,7 @@ func TestMumble_RetryBudgetResetsAfterSuccess(t *testing.T) {
 	manager.managerConfig = &ConnectionManagerConfig{MaxRetries: 1, BaseRetryDelay: time.Millisecond, MaxRetryDelay: time.Millisecond, RetryMultiplier: 2}
 	attempts := 0
 	connected := make(chan struct{}, 2)
-	manager.connectFunc = func() error {
+	manager.connectFunc = func(context.Context, uint64) error {
 		attempts++
 		if attempts == 1 || attempts == 3 {
 			return errors.New("transient")
@@ -80,7 +83,7 @@ func TestMumble_ConfiguredChannelFailureNeverConnects(t *testing.T) {
 	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), emitter)
 	manager.SetTargetChannel([]string{"typo-channel"})
 	manager.managerConfig = &ConnectionManagerConfig{MaxRetries: 0, BaseRetryDelay: time.Millisecond, MaxRetryDelay: time.Millisecond, RetryMultiplier: 2}
-	manager.connectFunc = func() error { return errors.New("configured Mumble channel not found") }
+	manager.connectFunc = func(context.Context, uint64) error { return errors.New("configured Mumble channel not found") }
 	manager.connectionLoop(context.Background())
 
 	assert.Equal(t, ConnectionFailed, manager.GetStatus())
@@ -110,7 +113,7 @@ func TestMumble_TargetChannelConfigurationIsCopied(t *testing.T) {
 func TestMumble_StopClosedDisconnectChannelBoundary(t *testing.T) {
 	for iteration := 0; iteration < 100; iteration++ {
 		manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
-		manager.connectFunc = func() error { return nil }
+		manager.connectFunc = func(context.Context, uint64) error { return nil }
 		loopCtx, cancelLoop := context.WithCancel(context.Background())
 		done := make(chan struct{})
 		go func() {
@@ -559,8 +562,8 @@ func TestMumble_DisconnectChannelBuffer(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// TestMumble_GetAudioOutgoingNilClient tests GetAudioOutgoing with nil client
-func TestMumble_GetAudioOutgoingNilClient(t *testing.T) {
+// TestMumble_SendAudioNilClient tests manager-owned handoff with no client.
+func TestMumble_SendAudioNilClient(t *testing.T) {
 	logger := NewMockLogger()
 	emitter := NewMockBridgeEventEmitter()
 
@@ -570,9 +573,7 @@ func TestMumble_GetAudioOutgoingNilClient(t *testing.T) {
 
 	manager := NewMumbleConnectionManager("localhost:64738", config, nil, logger, emitter)
 
-	// Without starting, client should be nil
-	audioOut := manager.GetAudioOutgoing()
-	assert.Nil(t, audioOut)
+	assert.False(t, manager.SendAudio(context.Background(), gumble.AudioBuffer{1}, time.Millisecond))
 }
 
 // TestMumble_StatusTransitionsUnderLoad tests status changes under concurrent load
@@ -628,4 +629,139 @@ func TestMumble_StatusTransitionsUnderLoad(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Logf("Completed %d reads and %d writes", atomic.LoadInt32(&reads), atomic.LoadInt32(&writes))
+}
+
+func TestMumble_ProductionDialAttemptHasFiniteTimeout(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	manager.InitContext(context.Background())
+	manager.runMutex.Lock()
+	manager.running = true
+	manager.runMutex.Unlock()
+	manager.connectTimeout = 37 * time.Millisecond
+	manager.dialFunc = func(dialer *net.Dialer, _ string, _ *gumble.Config, _ *tls.Config) (*gumble.Client, error) {
+		assert.Equal(t, 37*time.Millisecond, dialer.Timeout)
+		return nil, errors.New("offline dial failure")
+	}
+
+	require.ErrorContains(t, manager.connect(manager.ctx, manager.generation), "failed to connect")
+	require.NoError(t, manager.Stop())
+}
+
+func TestMumble_ChannelSyncAttemptHonorsCanceledContext(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.InitContext(ctx)
+	cancel()
+	client := &gumble.Client{Channels: gumble.Channels{0: &gumble.Channel{ID: 0}}}
+
+	require.ErrorIs(t, manager.moveToTargetChannel(client), context.Canceled)
+	require.NoError(t, manager.Stop())
+}
+
+func TestMumble_StopJoinsConnectionLoop(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	entered := make(chan struct{})
+	exited := make(chan struct{})
+	manager.connectFunc = func(context.Context, uint64) error {
+		close(entered)
+		<-manager.ctx.Done()
+		close(exited)
+		return context.Canceled
+	}
+	require.NoError(t, manager.Start(context.Background()))
+	<-entered
+
+	require.NoError(t, manager.Stop())
+	select {
+	case <-exited:
+	default:
+		t.Fatal("Stop returned before the connection loop's active attempt exited")
+	}
+}
+
+func TestMumble_CanceledGenerationCannotPublishSuccess(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	channel := &gumble.Channel{ID: 0}
+	client := &gumble.Client{
+		Channels: gumble.Channels{0: channel},
+		Self:     &gumble.User{Channel: channel},
+	}
+	manager.dialFunc = func(*net.Dialer, string, *gumble.Config, *tls.Config) (*gumble.Client, error) {
+		close(entered)
+		<-release
+		return client, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, manager.Start(ctx))
+	<-entered
+	cancel()
+	close(release)
+	require.NoError(t, manager.Stop())
+	require.NotEqual(t, ConnectionConnected, manager.GetStatus())
+	require.Nil(t, manager.GetClient())
+	manager.audioMutex.Lock()
+	require.Nil(t, manager.audioOutgoing)
+	manager.audioMutex.Unlock()
+}
+
+func TestMumble_DisconnectEventsRequireCurrentActiveClient(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	current := &gumble.Client{}
+	stale := &gumble.Client{}
+	manager.runMutex.Lock()
+	manager.running = true
+	manager.runMutex.Unlock()
+	manager.clientMutex.Lock()
+	manager.client = current
+	manager.clientMutex.Unlock()
+
+	manager.OnDisconnect(&gumble.DisconnectEvent{Client: stale, Type: gumble.DisconnectError, String: "stale"})
+	require.Empty(t, manager.disconnectCh)
+	manager.OnDisconnect(&gumble.DisconnectEvent{Client: current, Type: gumble.DisconnectError, String: "current"})
+	require.Len(t, manager.disconnectCh, 1)
+	<-manager.disconnectCh
+	manager.runMutex.Lock()
+	manager.running = false
+	manager.runMutex.Unlock()
+	manager.OnDisconnect(&gumble.DisconnectEvent{Client: current, Type: gumble.DisconnectError, String: "stopped"})
+	require.Empty(t, manager.disconnectCh)
+	manager.clientMutex.Lock()
+	manager.client = nil
+	manager.clientMutex.Unlock()
+	require.NoError(t, manager.Stop())
+}
+
+func TestMumble_ManagerOwnsOutgoingAcrossPipelinePauseAndRetirement(t *testing.T) {
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	outgoing := make(chan gumble.AudioBuffer, 2)
+	manager.audioMutex.Lock()
+	manager.audioOutgoing = outgoing
+	manager.audioMutex.Unlock()
+	bridge := createTestBridgeState(nil)
+	bridge.MumbleConnectionManager = manager
+	duplex := NewMumbleDuplex(bridge.Logger, bridge)
+	internal := make(chan gumble.AudioBuffer, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	before := testutil.ToFloat64(promSentMumblePackets)
+	go func() {
+		duplex.toMumbleSender(ctx, internal)
+		close(done)
+	}()
+	internal <- gumble.AudioBuffer{1, 2, 3}
+	require.Equal(t, gumble.AudioBuffer{1, 2, 3}, <-outgoing)
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(promSentMumblePackets) == before+1
+	}, time.Second, time.Millisecond)
+	cancel()
+	<-done
+
+	require.NotPanics(t, func() { outgoing <- gumble.AudioBuffer{4} }, "pipeline pause must not close persistent-client audio")
+	<-outgoing
+	manager.disconnectInternal()
+	_, open := <-outgoing
+	require.False(t, open, "client retirement must close AudioOutgoing")
+	require.NotPanics(t, manager.disconnectInternal, "retirement must close AudioOutgoing exactly once")
 }

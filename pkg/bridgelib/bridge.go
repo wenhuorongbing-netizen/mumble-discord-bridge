@@ -104,6 +104,7 @@ type BridgeInstance struct {
 	// Context for graceful shutdown
 	ctx    context.Context
 	cancel context.CancelFunc
+	modeWg sync.WaitGroup
 }
 
 // NewBridgeInstance creates a new bridge instance
@@ -290,12 +291,28 @@ func (b *BridgeInstance) Start() error {
 		// Populate existing Discord users (GuildCreate may have fired before handlers were registered)
 		b.State.PopulateExistingDiscordUsers()
 		b.State.AutoChanDie = make(chan bool)
-		go b.State.MumblePingLoop(b.ctx)
-		go b.State.AutoBridge()
+		b.modeWg.Add(2)
+		go func() {
+			defer b.modeWg.Done()
+			b.State.MumblePingLoop(b.ctx)
+		}()
+		go func() {
+			defer b.modeWg.Done()
+			b.State.AutoBridge()
+		}()
 	case bridge.BridgeModeConstant:
 		b.logger.Info("BRIDGE_MODE", "Using Constant mode")
 		b.logger.Debug("BRIDGE_MODE", "Starting constant mode goroutine")
+		b.State.RegisterBridgeStartIntent()
+		b.modeWg.Add(1)
 		go func() {
+			defer b.modeWg.Done()
+			intentPending := true
+			defer func() {
+				if intentPending {
+					b.State.CancelBridgeStartIntent()
+				}
+			}()
 			for {
 				select {
 				case <-b.ctx.Done():
@@ -305,17 +322,14 @@ func (b *BridgeInstance) Start() error {
 				default:
 					b.logger.Info("BRIDGE_MODE", "Starting bridge in constant mode")
 
-					// Set DiscordChannelID from config for constant mode
-					b.State.DiscordChannelID = b.config.DiscordCID
-					b.logger.Debug("BRIDGE_MODE", fmt.Sprintf("Set DiscordChannelID to %s", b.config.DiscordCID))
-
 					b.logger.Debug("BRIDGE_START", "Stopping any existing Discord voice connection before reconnection")
 					b.State.StopDiscordVoice()
 
 					b.logger.Debug("BRIDGE_START", "Calling State.StartBridge()")
 
 					// Start the bridge and verify it connected successfully
-					b.State.StartBridge()
+					intentPending = false
+					b.State.StartBridgeFromIntent()
 					b.logger.Debug("BRIDGE_START", "State.StartBridge() returned")
 
 					// Check if the bridge is connected
@@ -338,28 +352,38 @@ func (b *BridgeInstance) Start() error {
 
 						return
 					case <-time.After(5 * time.Second):
-						// Continue to next iteration
+						b.State.RegisterBridgeStartIntent()
+						intentPending = true
 					}
 				}
 			}
 		}()
 	case bridge.BridgeModeMumble:
 		b.logger.Info("BRIDGE_MODE", "Using Mumble presence mode")
-		b.State.DiscordChannelID = b.config.DiscordCID
 		b.State.AutoChanDie = make(chan bool)
-		go b.State.MumblePresenceBridge()
+		b.modeWg.Add(1)
+		go func() {
+			defer b.modeWg.Done()
+			b.State.MumblePresenceBridge()
+		}()
 	case bridge.BridgeModeManual:
 		b.logger.Info("BRIDGE_MODE", "Using Manual mode")
 		b.logger.Debug("BRIDGE_MODE", "Starting manual mode goroutine")
+		b.State.RegisterBridgeStartIntent()
+		b.modeWg.Add(1)
 		go func() {
+			defer b.modeWg.Done()
+			intentPending := true
+			defer func() {
+				if intentPending {
+					b.State.CancelBridgeStartIntent()
+				}
+			}()
 			b.logger.Info("BRIDGE_MODE", "Starting bridge in manual mode")
 
-			// Set DiscordChannelID from config for manual mode
-			b.State.DiscordChannelID = b.config.DiscordCID
-			b.logger.Debug("BRIDGE_MODE", fmt.Sprintf("Set DiscordChannelID to %s", b.config.DiscordCID))
-
 			b.logger.Debug("BRIDGE_START", "Calling State.StartBridge() in manual mode")
-			b.State.StartBridge()
+			intentPending = false
+			b.State.StartBridgeFromIntent()
 			b.logger.Debug("BRIDGE_START", "State.StartBridge() returned in manual mode")
 
 			// Check if the bridge is connected
@@ -410,40 +434,31 @@ func (b *BridgeInstance) Stop() error {
 
 	b.logger.Debug("BRIDGE_STOP", "Canceling context")
 
+	// Hold a stop guard through handler/dispatcher teardown. StartBridge also
+	// snapshots the stop epoch, so calls already in flight cannot outlive it.
+	b.State.RegisterBridgeStartIntent()
+
 	// Cancel the context to signal all operations to stop
 	b.cancel()
-
-	// Mark bridge as stopped
-	b.stopped = true
-	b.logger.Debug("BRIDGE_STOP", "Bridge marked as stopped")
 
 	// Stop the auto/mumble bridge if it's running
 	if (b.State.Mode == bridge.BridgeModeAuto || b.State.Mode == bridge.BridgeModeMumble) && b.State.AutoChanDie != nil {
 		b.logger.Debug("BRIDGE_STOP", "Sending stop signal to auto/mumble bridge")
-		b.State.AutoChanDie <- true
+		// Stop is serialized by b.mu and guarded by b.stopped, so this channel
+		// has one close owner. A close is retained even while the mode worker is
+		// busy outside its select; a nonblocking send could be lost.
+		close(b.State.AutoChanDie)
 		b.logger.Debug("BRIDGE_STOP", "Auto/mumble bridge stop signal sent")
 	}
 
-	// Stop the bridge if it's active.
-	// Read state under lock, then unlock before blocking send/wait to avoid
-	// deadlock if cleanup code needs BridgeMutex.
-	b.logger.Debug("BRIDGE_STOP", "Checking bridge connection status")
-	b.State.BridgeMutex.Lock()
-	connected := b.State.Connected || b.State.BridgeActive
-	b.State.BridgeMutex.Unlock()
+	// StopBridge snapshots the published session cancellation/done pair and
+	// returns only after full audio and connection cleanup.
+	b.State.StopBridge()
+	b.modeWg.Wait()
 
-	if connected {
-		b.logger.Debug("BRIDGE_STOP", "Bridge is connected, sending die signal")
-		select {
-		case b.State.BridgeDie <- true:
-		default:
-		}
-		b.logger.Debug("BRIDGE_STOP", "Waiting for bridge exit")
-		b.State.WaitExit.Wait()
-		b.logger.Debug("BRIDGE_STOP", "Bridge exit completed")
-	} else {
-		b.logger.Debug("BRIDGE_STOP", "Bridge is not connected, skipping die signal")
-	}
+	// Publish stopped only after every mode/session worker has retired.
+	b.stopped = true
+	b.logger.Debug("BRIDGE_STOP", "Bridge marked as stopped")
 
 	// Remove the Discord event handler so a stopped bridge no longer
 	// receives events from the shared client.
@@ -458,6 +473,7 @@ func (b *BridgeInstance) Stop() error {
 		b.eventDispatcher.Stop()
 		b.logger.Debug("BRIDGE_STOP", "Event dispatcher stopped")
 	}
+	b.State.CancelBridgeStartIntent()
 
 	b.logger.Info("BRIDGE_STOP", "Bridge stopped successfully")
 

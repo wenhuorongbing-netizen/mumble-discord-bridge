@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 	"testing"
@@ -173,6 +174,62 @@ func TestDiscordDuplex_FromDiscordMixerUsesSaturatingMixer(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("production Discord mixer did not stop")
 	}
+}
+
+func TestDiscordToMumbleTrailingSilenceIsExactly480Samples(t *testing.T) {
+	silence := mumbleTrailingSilence()
+	require.Len(t, silence, 480)
+	for _, sample := range silence {
+		require.Zero(t, sample)
+	}
+}
+
+func TestMumbleSentCounterChangesOnlyAtFinalSuccessfulHandoff(t *testing.T) {
+	before := testutil.ToFloat64(promSentMumblePackets)
+	manager := NewMumbleConnectionManager("unused", &gumble.Config{}, nil, NewMockLogger(), nil)
+	bridge := createTestBridgeState(nil)
+	bridge.MumbleConnectionManager = manager
+	duplex := NewMumbleDuplex(bridge.Logger, bridge)
+	internal := make(chan gumble.AudioBuffer, 1)
+	internal <- gumble.AudioBuffer{1}
+	close(internal)
+
+	duplex.toMumbleSender(context.Background(), internal)
+	require.Equal(t, before, testutil.ToFloat64(promSentMumblePackets), "failed handoff must not increment sent count")
+
+	manager.audioMutex.Lock()
+	manager.audioOutgoing = make(chan gumble.AudioBuffer, 1)
+	manager.audioMutex.Unlock()
+	internal = make(chan gumble.AudioBuffer, 1)
+	internal <- gumble.AudioBuffer{2}
+	close(internal)
+	duplex.toMumbleSender(context.Background(), internal)
+	require.Equal(t, before+1, testutil.ToFloat64(promSentMumblePackets), "successful gumble handoff must increment exactly once")
+	manager.disconnectInternal()
+}
+
+func TestMumbleDuplex_StreamRegistrationMetricReadIsSynchronized(t *testing.T) {
+	duplex := NewMumbleDuplex(NewMockLogger(), createTestBridgeState(nil))
+	const streams = 100
+	var wg sync.WaitGroup
+	for i := 0; i < streams; i++ {
+		packets := make(chan *gumble.AudioPacket)
+		close(packets)
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			duplex.OnAudioStream(&gumble.AudioStreamEvent{
+				User: &gumble.User{Name: fmt.Sprintf("user-%d", index)},
+				C:    packets,
+			})
+		}(i)
+	}
+	wg.Wait()
+	require.Eventually(t, func() bool {
+		duplex.mutex.Lock()
+		defer duplex.mutex.Unlock()
+		return len(duplex.streams) == 0
+	}, time.Second, time.Millisecond)
 }
 
 // ---------------------------------------------------------------------------

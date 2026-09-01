@@ -124,6 +124,20 @@ type BridgeState struct { //nolint:revive // API consistency: keeping Bridge pre
 	// Wait for bridge to exit cleanly
 	WaitExit *sync.WaitGroup
 
+	// Active StartBridge session publication. BridgeMutex protects both fields;
+	// only StartBridge closes bridgeDone after full cleanup.
+	bridgeCancel context.CancelFunc
+	bridgeCtx    context.Context
+	bridgeDone   chan struct{}
+	startIntents int
+	stopPending  bool
+	stopEpoch    uint64
+
+	// Private deterministic seams; production uses the concrete methods.
+	initializeManagers func() error
+	startManagers      func() error
+	stopManagers       func()
+
 	// Bridge State Mutex
 	BridgeMutex sync.Mutex
 
@@ -724,6 +738,33 @@ func (b *BridgeState) stopConnectionManagers() {
 	b.Logger.Info("BRIDGE", "Connection managers stopped")
 }
 
+// failReadinessAndResetMetrics makes teardown visible before blocking cleanup
+// and clears all session-scoped connection, uptime, stream, and buffer gauges.
+func (b *BridgeState) failReadinessAndResetMetrics() {
+	b.BridgeMutex.Lock()
+	b.Connected = false
+	b.DiscordConnected = false
+	b.MumbleConnected = false
+	b.DiscordOutboundHealth = discordOutboundUnproven
+	b.StartTime = time.Time{}
+	b.BridgeMutex.Unlock()
+
+	promDiscordConnectionStatus.Set(float64(ConnectionDisconnected))
+	promMumbleConnectionStatus.Set(float64(ConnectionDisconnected))
+	promDiscordConnectionUptime.Set(0)
+	promMumbleConnectionUptime.Set(0)
+	promDiscordOutboundHealth.Set(float64(discordOutboundUnproven))
+	promMumbleBufferedPackets.Set(0)
+	promMumbleArraySize.Set(0)
+	promMumbleStreaming.Set(0)
+	promMumbleMaxStreamDepth.Set(0)
+	promDiscordArraySize.Set(0)
+	promDiscordStreaming.Set(0)
+	promToDiscordJitterBuffer.Set(0)
+	promRtpTimestampDrift.Set(0)
+	b.notifyMetricsChange()
+}
+
 // StopDiscordVoice stops the Discord voice connection independently, without
 // affecting the Mumble connection. This is used by constant mode between
 // reconnection cycles to ensure the old voice connection is fully cleaned up
@@ -956,35 +997,103 @@ func (b *BridgeState) updateConnectionMetrics() {
 	}
 }
 
-// StartBridge establishes the voice bridge using managed connections
+// RegisterBridgeStartIntent publishes a mode-owned future StartBridge call so
+// StopBridge can cancel it before the session itself is published.
+func (b *BridgeState) RegisterBridgeStartIntent() {
+	b.BridgeMutex.Lock()
+	b.startIntents++
+	b.BridgeMutex.Unlock()
+}
+
+// CancelBridgeStartIntent retires an intent whose owner exits before calling
+// StartBridgeFromIntent. The last retired intent also clears its pending stop.
+func (b *BridgeState) CancelBridgeStartIntent() {
+	b.BridgeMutex.Lock()
+	if b.startIntents > 0 {
+		b.startIntents--
+	}
+	if b.startIntents == 0 {
+		b.stopPending = false
+	}
+	b.BridgeMutex.Unlock()
+}
+
+// StartBridge establishes the voice bridge using managed connections.
 func (b *BridgeState) StartBridge() {
+	b.startBridge(false)
+}
+
+// StartBridgeFromIntent consumes one previously registered mode-owned intent.
+func (b *BridgeState) StartBridgeFromIntent() {
+	b.startBridge(true)
+}
+
+func (b *BridgeState) startBridge(fromIntent bool) {
 	b.Logger.Debug("BRIDGE", "StartBridge called, checking connection status")
+	b.BridgeMutex.Lock()
+	startEpoch := b.stopEpoch
+	pendingAtEntry := b.stopPending
+	b.BridgeMutex.Unlock()
+
+	b.lock.Lock()
 
 	b.BridgeMutex.Lock()
+	if fromIntent {
+		if b.startIntents > 0 {
+			b.startIntents--
+		}
+		if b.stopPending {
+			if b.startIntents == 0 {
+				b.stopPending = false
+			}
+			b.BridgeMutex.Unlock()
+			b.lock.Unlock()
+			b.Logger.Debug("BRIDGE", "Bridge start intent consumed by pending stop")
+			return
+		}
+	} else if pendingAtEntry || b.stopPending || startEpoch != b.stopEpoch {
+		b.BridgeMutex.Unlock()
+		b.lock.Unlock()
+		b.Logger.Debug("BRIDGE", "Bridge start overlapped a stop request")
+		return
+	}
 	if b.Connected || b.BridgeActive {
 		b.Logger.Info("BRIDGE", "Bridge already active, aborting start")
 		b.BridgeMutex.Unlock()
+		b.lock.Unlock()
 
 		return
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	b.BridgeActive = true
+	b.bridgeCtx = ctx
+	b.bridgeCancel = cancel
+	b.bridgeDone = done
 	b.DiscordOutboundHealth = discordOutboundUnproven
 	promDiscordOutboundHealth.Set(float64(discordOutboundUnproven))
 	// Set StartTime while holding lock to prevent races
 	b.StartTime = time.Now()
 	b.presenceAnnounced = false
 	b.BridgeMutex.Unlock()
+	defer func() {
+		cancel()
+		b.failReadinessAndResetMetrics()
+		b.BridgeMutex.Lock()
+		b.BridgeActive = false
+		if b.bridgeDone == done {
+			b.bridgeCtx = nil
+			b.bridgeCancel = nil
+			b.bridgeDone = nil
+		}
+		b.BridgeMutex.Unlock()
+		// Release the session serialization lock before publishing completion so
+		// StopBridge cannot return while a StartBridge-owned finalizer remains.
+		b.lock.Unlock()
+		close(done)
+	}()
 
 	b.Logger.Info("BRIDGE", "Starting bridge process with managed connections")
-
-	b.lock.Lock()
-	defer b.lock.Unlock()
-
-	b.BridgeDie = make(chan bool)
-	defer close(b.BridgeDie)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	wg := sync.WaitGroup{}
 	b.WaitExit = &wg
@@ -993,16 +1102,28 @@ func (b *BridgeState) StartBridge() {
 	promBridgeStartTime.SetToCurrentTime()
 
 	// Initialize connection managers
-	if err := b.initializeConnectionManagers(); err != nil {
+	initializeManagers := b.initializeConnectionManagers
+	if b.initializeManagers != nil {
+		initializeManagers = b.initializeManagers
+	}
+	if err := initializeManagers(); err != nil {
 		b.Logger.Error("BRIDGE", fmt.Sprintf("Failed to initialize connection managers: %v", err))
 
 		return
 	}
 
 	// Start connection managers
-	if err := b.startConnectionManagers(); err != nil {
+	startManagers := b.startConnectionManagers
+	if b.startManagers != nil {
+		startManagers = b.startManagers
+	}
+	if err := startManagers(); err != nil {
 		b.Logger.Error("BRIDGE", fmt.Sprintf("Failed to start connection managers: %v", err))
-		b.stopConnectionManagers()
+		if b.stopManagers != nil {
+			b.stopManagers()
+		} else {
+			b.stopConnectionManagers()
+		}
 
 		return
 	}
@@ -1114,30 +1235,24 @@ func (b *BridgeState) StartBridge() {
 	// Discord and Mumble report connected via their connection event handlers.
 	b.Logger.Info("BRIDGE", "Bridge started with managed connections, waiting for connections")
 
-	// Hold until canceled or external die request
-	select {
-	case <-ctx.Done():
-		b.Logger.Debug("BRIDGE", "Bridge internal context cancel")
-	case <-b.BridgeDie:
-		b.Logger.Debug("BRIDGE", "Bridge die request received")
-		cancel()
-	}
+	// Hold until canceled by the session owner.
+	<-ctx.Done()
+	b.Logger.Debug("BRIDGE", "Bridge internal context cancel")
 
-	// Send disconnect announcement while connections are still active
+	// Fail readiness before any blocking cleanup while transports remain usable
+	// for the best-effort disconnect announcement.
+	b.failReadinessAndResetMetrics()
 	b.sendDisconnectAnnouncement()
-
-	b.BridgeMutex.Lock()
-	b.Connected = false
-	b.BridgeActive = false
-	b.BridgeMutex.Unlock()
-
-	b.notifyMetricsChange()
 
 	// Clean up audio, then stop connection managers to close the Discord UDP
 	// socket. This unblocks discordReceivePCM's blocking ReceiveOpus() call
 	// so wg.Wait() can complete.
 	cleanupAudio()
-	b.stopConnectionManagers()
+	if b.stopManagers != nil {
+		b.stopManagers()
+	} else {
+		b.stopConnectionManagers()
+	}
 
 	wg.Wait()
 	b.Logger.Info("BRIDGE", "Terminating Bridge")
@@ -1155,19 +1270,21 @@ func (b *BridgeState) StartBridge() {
 func (b *BridgeState) StopBridge() {
 	b.Logger.Info("BRIDGE", "StopBridge called, initiating graceful shutdown")
 
-	// Signal bridge to stop
-	select {
-	case b.BridgeDie <- true:
-		b.Logger.Debug("BRIDGE", "Bridge stop signal sent")
-	default:
-		b.Logger.Debug("BRIDGE", "Bridge stop signal channel full or closed")
+	b.BridgeMutex.Lock()
+	b.stopEpoch++
+	cancel := b.bridgeCancel
+	done := b.bridgeDone
+	if b.startIntents > 0 {
+		b.stopPending = true
 	}
-
-	// Wait for bridge to exit cleanly if WaitExit is available
-	if b.WaitExit != nil {
-		b.Logger.Debug("BRIDGE", "Waiting for bridge to exit cleanly")
-		b.WaitExit.Wait()
-		b.Logger.Debug("BRIDGE", "Bridge exited cleanly")
+	b.BridgeMutex.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		b.Logger.Debug("BRIDGE", "Waiting for bridge session cleanup")
+		<-done
+		b.Logger.Debug("BRIDGE", "Bridge session cleanup completed")
 	}
 }
 
@@ -1380,6 +1497,7 @@ func (b *BridgeState) refreshDiscordVoiceUsers() {
 func (b *BridgeState) AutoBridge() {
 	b.Logger.Info("BRIDGE", "Beginning auto mode with managed connections")
 	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -1402,7 +1520,8 @@ func (b *BridgeState) AutoBridge() {
 		// Check if bridge should be started (use BridgeActive to avoid starting during connection window)
 		if !b.BridgeActive && b.MumbleUserCount > 0 && len(b.DiscordUsers) > 0 {
 			b.Logger.Info("BRIDGE", "Users detected in mumble and discord, starting bridge")
-			go b.StartBridge()
+			b.startIntents++ // BridgeMutex is held across this decision.
+			go b.StartBridgeFromIntent()
 		}
 
 		// Stop bridge when either side has no users
@@ -1459,8 +1578,11 @@ func (b *BridgeState) MumblePresenceBridge() {
 		return
 	}
 
-	// Monitor Mumble connection events in background
+	// Monitor Mumble connection events in background and join it during mode teardown.
+	var mumbleMonitorWg sync.WaitGroup
+	mumbleMonitorWg.Add(1)
 	go func() {
+		defer mumbleMonitorWg.Done()
 		for {
 			select {
 			case <-mumbleCtx.Done():
@@ -1622,6 +1744,7 @@ func (b *BridgeState) MumblePresenceBridge() {
 			if err := b.MumbleConnectionManager.Stop(); err != nil {
 				b.Logger.Error("BRIDGE", fmt.Sprintf("Error stopping Mumble connection manager: %v", err))
 			}
+			mumbleMonitorWg.Wait()
 			time.Sleep(200 * time.Millisecond)
 
 			b.BridgeMutex.Lock()
@@ -1842,6 +1965,13 @@ func (b *BridgeState) stopAudioPipeline() {
 	promDiscordOutboundHealth.Set(float64(discordOutboundInactive))
 	b.updateOverallConnectionState()
 	b.BridgeMutex.Unlock()
+	promMumbleBufferedPackets.Set(0)
+	promMumbleArraySize.Set(0)
+	promMumbleStreaming.Set(0)
+	promMumbleMaxStreamDepth.Set(0)
+	promDiscordArraySize.Set(0)
+	promDiscordStreaming.Set(0)
+	promToDiscordJitterBuffer.Set(0)
 
 	// Send disconnect announcement while connections are still active
 	b.sendDisconnectAnnouncement()
@@ -1925,7 +2055,10 @@ func (b *BridgeState) discordSendMessage(msg string) {
 
 		return
 	case "user":
-		b.Logger.Debug("MUMBLE→DISCORD", fmt.Sprintf("Sending direct messages to %d Discord users", len(b.DiscordUsers)))
+		b.DiscordUsersMutex.Lock()
+		userCount := len(b.DiscordUsers)
+		b.DiscordUsersMutex.Unlock()
+		b.Logger.Debug("MUMBLE→DISCORD", fmt.Sprintf("Sending direct messages to %d Discord users", userCount))
 		b.DiscordUsersMutex.Lock()
 		defer b.DiscordUsersMutex.Unlock()
 
