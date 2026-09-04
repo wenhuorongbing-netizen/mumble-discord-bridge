@@ -183,6 +183,7 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 	streaming := false
 	lastReady := true
 	ratchetMissing := false
+	ordinarySendFailed := false
 	var speakingStart time.Time
 	var noDataTicks int // Consecutive sender ticks with no data from buffer
 
@@ -216,7 +217,7 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 		}
 
 		err := voiceConn.SendOpus(opus)
-		if !dd.handleDiscordSendResult(err, &ratchetMissing) {
+		if !dd.handleDiscordSendResult(err, &ratchetMissing, &ordinarySendFailed) {
 			return
 		}
 
@@ -318,14 +319,18 @@ func (dd *DiscordDuplex) toDiscordSender(ctx context.Context, opusBuffer <-chan 
 	}
 }
 
-// handleDiscordSendResult tracks missing-key-ratchet episodes independently
-// from voice connection readiness and reports whether the packet was sent.
-func (dd *DiscordDuplex) handleDiscordSendResult(err error, ratchetMissing *bool) bool {
+// handleDiscordSendResult tracks send-failure episodes independently from voice
+// connection readiness and reports whether the packet was sent.
+func (dd *DiscordDuplex) handleDiscordSendResult(err error, ratchetMissing, ordinarySendFailed *bool) bool {
 	if err == nil {
 		dd.Bridge.setDiscordOutboundHealth(discordOutboundHealthy)
 		if *ratchetMissing {
 			dd.Bridge.Logger.Info("DISCORD_SEND", "Discord opus sender recovered from missing key ratchet")
 			*ratchetMissing = false
+		}
+		if *ordinarySendFailed {
+			dd.Bridge.Logger.Info("DISCORD_SEND", "Discord opus sender recovered from send failure")
+			*ordinarySendFailed = false
 		}
 
 		return true
@@ -342,7 +347,11 @@ func (dd *DiscordDuplex) handleDiscordSendResult(err error, ratchetMissing *bool
 		return false
 	}
 
-	dd.Bridge.Logger.Debug("DISCORD_SEND", fmt.Sprintf("Error sending opus: %v", err))
+	if !*ordinarySendFailed {
+		dd.Bridge.Logger.Debug("DISCORD_SEND", fmt.Sprintf("Error sending opus: %v", err))
+		*ordinarySendFailed = true
+	}
+	promPacketsSunk.WithLabelValues("discord", "outbound").Inc()
 
 	return false
 }

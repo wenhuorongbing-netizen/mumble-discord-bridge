@@ -22,18 +22,20 @@ func TestDiscordSendResult_MissingKeyRatchetTransitions(t *testing.T) {
 	mockLog := NewMockLogger()
 	dd := NewDiscordDuplex(createTestBridgeState(mockLog))
 	ratchetMissing := false
+	ordinarySendFailed := false
 	sunk := promPacketsSunk.WithLabelValues("discord", "outbound")
 	sunkBefore := testutil.ToFloat64(sunk)
 	missingErr := errors.New("send failed: missing key ratchet")
 
-	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing))
-	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing))
-	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing))
-	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing))
-	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing))
+	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing, &ordinarySendFailed))
+	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing, &ordinarySendFailed))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing, &ordinarySendFailed))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing, &ordinarySendFailed))
+	assert.False(t, dd.handleDiscordSendResult(missingErr, &ratchetMissing, &ordinarySendFailed))
 
 	assert.Equal(t, sunkBefore+3, testutil.ToFloat64(sunk), "every missing-ratchet packet must be sunk")
 	assert.True(t, ratchetMissing, "the later missing-ratchet episode must enter missing state")
+	assert.False(t, ordinarySendFailed, "ratchet failures must not enter the ordinary failure state")
 
 	entries := mockLog.GetEntries()
 	var warnings, recoveries int
@@ -49,14 +51,37 @@ func TestDiscordSendResult_MissingKeyRatchetTransitions(t *testing.T) {
 	assert.Equal(t, 1, recoveries, "only the first success after an episode must log recovery")
 }
 
-func TestDiscordSendResult_NonRatchetErrorPreservesDebugBehavior(t *testing.T) {
+func TestDiscordSendResult_OrdinaryFailureEpisodes(t *testing.T) {
 	mockLog := NewMockLogger()
 	dd := NewDiscordDuplex(createTestBridgeState(mockLog))
 	ratchetMissing := false
+	ordinarySendFailed := false
+	sunk := promPacketsSunk.WithLabelValues("discord", "outbound")
+	sunkBefore := testutil.ToFloat64(sunk)
+	ordinaryErr := errors.New("ordinary send failure")
 
-	assert.False(t, dd.handleDiscordSendResult(errors.New("ordinary send failure"), &ratchetMissing))
+	assert.False(t, dd.handleDiscordSendResult(ordinaryErr, &ratchetMissing, &ordinarySendFailed))
+	assert.False(t, dd.handleDiscordSendResult(ordinaryErr, &ratchetMissing, &ordinarySendFailed))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing, &ordinarySendFailed))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing, &ordinarySendFailed))
+	assert.False(t, dd.handleDiscordSendResult(ordinaryErr, &ratchetMissing, &ordinarySendFailed))
+
 	assert.False(t, ratchetMissing)
-	assert.True(t, mockLog.ContainsMessage("Error sending opus: ordinary send failure"))
+	assert.True(t, ordinarySendFailed, "the later ordinary episode must enter failed state")
+	assert.Equal(t, sunkBefore+3, testutil.ToFloat64(sunk), "every ordinary send error must sink its packet")
+
+	entries := mockLog.GetEntries()
+	var diagnostics, recoveries int
+	for _, entry := range entries {
+		if entry.Level == "DEBUG" && entry.Message == "Error sending opus: ordinary send failure" {
+			diagnostics++
+		}
+		if entry.Level == "INFO" && entry.Message == "Discord opus sender recovered from send failure" {
+			recoveries++
+		}
+	}
+	assert.Equal(t, 2, diagnostics, "each ordinary failure episode must log exactly once")
+	assert.Equal(t, 1, recoveries, "only the first success after an episode must log recovery")
 }
 
 func TestDiscordSendResult_ControlsCurrentReadiness(t *testing.T) {
@@ -67,12 +92,13 @@ func TestDiscordSendResult_ControlsCurrentReadiness(t *testing.T) {
 	bridge.BridgeMutex.Unlock()
 	dd := NewDiscordDuplex(bridge)
 	ratchetMissing := false
+	ordinarySendFailed := false
 
-	assert.False(t, dd.handleDiscordSendResult(errors.New("send failed"), &ratchetMissing))
+	assert.False(t, dd.handleDiscordSendResult(errors.New("send failed"), &ratchetMissing, &ordinarySendFailed))
 	assert.False(t, bridge.IsConnected())
 	assert.Equal(t, discordOutboundUnhealthy, bridge.DiscordOutboundHealth)
 	assert.Equal(t, float64(discordOutboundUnhealthy), testutil.ToFloat64(promDiscordOutboundHealth))
-	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing))
+	assert.True(t, dd.handleDiscordSendResult(nil, &ratchetMissing, &ordinarySendFailed))
 	assert.True(t, bridge.IsConnected())
 	assert.Equal(t, discordOutboundHealthy, bridge.DiscordOutboundHealth)
 	assert.Equal(t, float64(discordOutboundHealthy), testutil.ToFloat64(promDiscordOutboundHealth))
