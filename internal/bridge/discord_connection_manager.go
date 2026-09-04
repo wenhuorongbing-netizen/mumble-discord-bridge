@@ -291,7 +291,7 @@ func (d *DiscordVoiceConnectionManager) GetVoiceConnection() discord.VoiceConnec
 	d.connMutex.RLock()
 	defer d.connMutex.RUnlock()
 
-	if d.voiceConn == nil || !d.voiceConn.IsReady() {
+	if d.voiceConn == nil || !d.voiceConn.IsReady() || !d.voiceConn.IsGatewayReady() {
 		return nil
 	}
 

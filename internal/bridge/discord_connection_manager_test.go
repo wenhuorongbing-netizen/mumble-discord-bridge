@@ -354,8 +354,8 @@ func TestDiscord_GetVoiceConnection_NilWhenNotConnected(t *testing.T) {
 	assert.Nil(t, vc, "Expected nil VoiceConnection before starting")
 }
 
-// TestDiscord_GetVoiceConnection_ChecksReady returns nil when the underlying
-// voiceConn exists but IsReady() is false, and non-nil when true.
+// TestDiscord_GetVoiceConnection_ChecksReady returns nil unless the underlying
+// voice connection and its gateway are both ready.
 func TestDiscord_GetVoiceConnection_ChecksReady(t *testing.T) {
 	vc := &mockVoiceConn{ready: false}
 	client := &mockDiscordClientForConn{
@@ -378,10 +378,16 @@ func TestDiscord_GetVoiceConnection_ChecksReady(t *testing.T) {
 	assert.Nil(t, mgr.GetVoiceConnection(),
 		"Expected nil when voiceConn.IsReady() is false")
 
-	// Now mark as ready.
+	// Local ready state alone is insufficient when the gateway is stale.
 	vc.setReady(true)
-	assert.NotNil(t, mgr.GetVoiceConnection(),
-		"Expected non-nil when voiceConn.IsReady() is true")
+	vc.setGatewayReady(false)
+	assert.Nil(t, mgr.GetVoiceConnection(),
+		"Expected nil when voiceConn.IsReady() is true but its gateway is not ready")
+
+	// A fully ready connection is returned unchanged.
+	vc.setGatewayReady(true)
+	assert.Same(t, vc, mgr.GetVoiceConnection(),
+		"Expected the same voice connection when local and gateway readiness are true")
 
 	require.NoError(t, mgr.Stop())
 }
